@@ -1,5 +1,4 @@
 use bytemuck::{Pod, Zeroable};
-use pinocchio::Address;
 
 /// Global state for the shielded pool
 #[repr(C)]
