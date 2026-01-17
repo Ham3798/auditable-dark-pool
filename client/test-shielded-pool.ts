@@ -34,24 +34,27 @@ import { generateProof, type CircuitConfig } from "./proof.helper.js";
 
 const RPC_URL = process.env.RPC_URL || "https://api.devnet.solana.com";
 
+function requireEnv(name: string): string {
+    const value = process.env[name];
+    if (!value) {
+        throw new Error(`${name} is required`);
+    }
+    return value;
+}
+
 // Verifier deployed by sunspot
-const ZK_VERIFIER_PROGRAM_ID = address(
-    process.env.ZK_VERIFIER_PROGRAM_ID ||
-    "548u4SFWZMaRWZQqdyAgm66z7VRYtNHHF2sr7JTBXbwN"
-);
+const ZK_VERIFIER_PROGRAM_ID = address(requireEnv("ZK_VERIFIER_PROGRAM_ID"));
 
-// Our Pinocchio Application Program
-const SHIELDED_POOL_PROGRAM_ID = address(
-    process.env.SHIELDED_POOL_PROGRAM_ID ||
-    "Shield1111111111111111111111111111111111111"
-);
+// Our Pinocchio Shielded Pool Program
+const SHIELDED_POOL_PROGRAM_ID = address(requireEnv("SHIELDED_POOL_PROGRAM_ID"));
 
+const repoRoot = path.join(process.cwd(), "..");
 const circuitConfig: CircuitConfig = {
-    circuitDir: path.join(process.cwd(), ".."),
+    circuitDir: path.join(repoRoot, "noir_circuit"),
     circuitName: "shielded_pool",
 };
 
-const keypairDir = path.join(circuitConfig.circuitDir, "keypair");
+const keypairDir = path.join(repoRoot, "keypair");
 const deployerWalletPath = path.join(keypairDir, "deployer.json");
 
 const INSTRUCTION = {
