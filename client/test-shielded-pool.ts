@@ -144,7 +144,9 @@ async function sendTransaction(
     assertIsTransactionWithBlockhashLifetime(signedTx);
     const sig = await sendAndConfirm(signedTx, { commitment: "confirmed" });
     const sigText = sig ?? getSignatureFromTransaction(signedTx);
-    console.log(`✅ ${label} Success! TX: ${sigText}`);
+    console.log(
+        `✅ ${label} Success! TX: https://explorer.solana.com/tx/${sigText}?cluster=devnet`
+    );
 }
 
 async function expectFailure(
