@@ -108,6 +108,9 @@ solana program deploy path/to/verifier.so --url devnet
 
 ### 3) Build & deploy the shielded pool program
 
+Before building, update the verifier program ID in
+`shielded_pool_program/src/instructions/withdraw.rs` to match the verifier you just deployed.
+
 ```bash
 cargo build-sbf --manifest-path shielded_pool_program/Cargo.toml
 solana program deploy shielded_pool_program/target/deploy/shielded_pool_pinocchio.so --url devnet
