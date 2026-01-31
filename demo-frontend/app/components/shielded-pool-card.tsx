@@ -388,25 +388,36 @@ export function ShieldedPoolCard() {
   }, [walletAddress, vaultAddress, stateAddress, proofHex, witnessHex, recipientAddress, send, selectedDeposit]);
 
   // Generate Prover.toml content
-  const generateProverToml = useCallback((deposit: DepositRecord) => {
-    let toml = `# Prover.toml - Copy this to noir_circuit/Prover.toml\n`;
-    toml += `root = "${deposit.root}"\n`;
-    toml += `nullifier = "${deposit.nullifier}"\n`;
-    toml += `recipient = "${deposit.recipient}"\n`;
-    toml += `amount = ${deposit.amount}\n`;
-    toml += `wa_commitment = "${deposit.waCommitment}"\n`;
-    toml += `secret_key = "${deposit.secretKey}"\n`;
-    toml += `owner_x = "${deposit.publicKeyX}"\n`;
-    toml += `owner_y = "${deposit.publicKeyY}"\n`;
-    toml += `randomness = "${deposit.randomness}"\n`;
-    toml += `index = ${deposit.leafIndex}\n`;
-    toml += `siblings = [\n`;
-    for (const sib of deposit.siblings) {
-      toml += `  "${sib}",\n`;
-    }
-    toml += `]\n`;
+  // IMPORTANT: recipient in proof must match Recipient Address submitted at withdraw.
+  // Use recipientAddress (withdraw target) when valid; else deposit.recipient (depositor at deposit time).
+  const generateProverToml = useCallback(
+    (deposit: DepositRecord) => {
+      let recipientField = deposit.recipient;
+      if (recipientAddress && recipientAddress.length >= 32 && recipientAddress.length <= 44) {
+        try {
+          recipientField = recipientFieldFromPubkey(recipientAddress as Address);
+        } catch {
+          // Invalid address, fall back to deposit.recipient
+        }
+      }
+      let toml = `# Prover.toml - Copy this to noir_circuit/Prover.toml\n`;
+      toml += `root = "${deposit.root}"\n`;
+      toml += `nullifier = "${deposit.nullifier}"\n`;
+        toml += `recipient = "${recipientField}"\n`;
+      toml += `amount = ${deposit.amount}\n`;
+      toml += `wa_commitment = "${deposit.waCommitment}"\n`;
+      toml += `secret_key = "${deposit.secretKey}"\n`;
+      toml += `owner_x = "${deposit.publicKeyX}"\n`;
+      toml += `owner_y = "${deposit.publicKeyY}"\n`;
+      toml += `randomness = "${deposit.randomness}"\n`;
+      toml += `index = ${deposit.leafIndex}\n`;
+      toml += `siblings = [\n`;
+      for (const sib of deposit.siblings) {
+        toml += `  "${sib}",\n`;
+      }
+      toml += `]\n`;
     return toml;
-  }, []);
+  }, [recipientAddress]);
 
   // Generate full CLI commands
   const generateCliCommands = useCallback(() => {
@@ -639,6 +650,21 @@ npx tsx generate-proof-hex.ts`;
           )}
 
           <div className="space-y-2">
+            <label className="text-xs text-muted">Withdraw to (recipient):</label>
+            <input
+              type="text"
+              placeholder="Solana address (must match proof recipient)"
+              value={recipientAddress}
+              onChange={(e) => setRecipientAddress(e.target.value)}
+              disabled={isSending}
+              className="w-full rounded-lg border border-border-low bg-card px-4 py-2.5 text-xs font-mono outline-none transition placeholder:text-muted focus:border-foreground/30 disabled:cursor-not-allowed disabled:opacity-60"
+            />
+            <p className="text-xs text-muted">
+              Enter the recipient <strong>before</strong> copying Prover.toml. The proof is bound to this address.
+            </p>
+          </div>
+
+          <div className="space-y-2">
             <div className="flex items-center justify-between">
               <p className="text-xs text-muted">1. Copy Prover.toml content:</p>
               <button
@@ -708,10 +734,10 @@ npx tsx generate-proof-hex.ts`;
         </div>
 
         <div className="space-y-2">
-          <label className="text-xs text-muted">Recipient Address:</label>
+          <label className="text-xs text-muted">Recipient Address (must match Step 2):</label>
           <input
             type="text"
-            placeholder="Solana address"
+            placeholder="Same address used when generating proof"
             value={recipientAddress}
             onChange={(e) => setRecipientAddress(e.target.value)}
             disabled={isSending}
