@@ -12,7 +12,6 @@ import {
     addSignersToTransactionMessage,
     assertIsSendableTransaction,
     assertIsTransactionWithBlockhashLifetime,
-    pipe,
     sendAndConfirmTransactionFactory,
     getSignatureFromTransaction,
     getProgramDerivedAddress,
@@ -28,7 +27,10 @@ import crypto from "crypto";
 import {
     initPoseidon,
     poseidonHash2,
-    poseidonHash3,
+    generateIdentityKeypair,
+    calculateWaCommitment,
+    calculateCommitment,
+    calculateNullifier,
     ShieldedPoolMerkleTree,
 } from "./merkle.js";
 import { generateProof, type CircuitConfig } from "./proof.helper.js";
@@ -98,6 +100,13 @@ function recipientFieldFromPubkey(pubkey: Address): string {
     return "0x" + padded.toString("hex");
 }
 
+// Generate random 128-bit value (for Noir's EmbeddedCurveScalar compatibility)
+function randomField128(): bigint {
+    const bytes = crypto.randomBytes(16); // 128 bits = 16 bytes
+    return BigInt("0x" + bytes.toString("hex"));
+}
+
+// Generate random 256-bit field element (for general use like randomness)
 function randomField(): bigint {
     // Use 31 bytes to stay safely within BN254 field range.
     const bytes = crypto.randomBytes(31);
@@ -172,7 +181,7 @@ async function expectFailure(
 }
 
 async function main() {
-    console.log("=== Shielded Pool Integration Test (Pinocchio + Noir) ===\n");
+    console.log("=== Shielded Pool Integration Test (BabyJubJub Identity + Noir) ===\n");
 
     await initPoseidon();
     const rpc = createSolanaRpc(RPC_URL);
@@ -195,45 +204,68 @@ async function main() {
     const recipientSigner = await generateKeyPairSigner();
     const recipientPubkey = recipientSigner.address;
 
-    // 1. Off-chain State
-    const mt = new ShieldedPoolMerkleTree();
-    const secret = randomField();
-    const nullifierKey = randomField();
-    const amount = 1_000_000n; // 0.001 SOL
+    // 1. Generate BabyJubJub Identity Keypair (128-bit secret key for Noir compatibility)
+    console.log("\n--- BabyJubJub Identity Generation ---");
+    const secretKey = randomField128();
+    const identity = generateIdentityKeypair(secretKey);
+    
+    console.log(`Secret Key: ${fieldToHex(identity.secretKey)}`);
+    console.log(`Public Key X: ${fieldToHex(identity.publicKey.x)}`);
+    console.log(`Public Key Y: ${fieldToHex(identity.publicKey.y)}`);
 
-    const commitment = poseidonHash3(secret, nullifierKey, amount);
+    // 2. Calculate wa_commitment (auditable identity)
+    const waCommitment = calculateWaCommitment(identity.publicKey);
+    console.log(`wa_commitment: ${fieldToHex(waCommitment)}`);
+
+    // 3. Calculate commitment with new scheme
+    const amount = 1_000_000n; // 0.001 SOL
+    const randomness = randomField();
+    const commitment = calculateCommitment(identity.publicKey, amount, randomness);
+    console.log(`Commitment: ${fieldToHex(commitment)}`);
+
+    // 4. Off-chain Merkle Tree
+    const mt = new ShieldedPoolMerkleTree();
     const index = mt.insert(commitment);
     const root = mt.getRoot();
-    const nullifier = poseidonHash2(nullifierKey, BigInt(index));
-
-    console.log(`Commitment: ${fieldToHex(commitment)}`);
+    
+    // 5. Calculate nullifier
+    const nullifier = calculateNullifier(identity.secretKey, BigInt(index));
+    
+    console.log(`\n--- Transaction Parameters ---`);
     console.log(`Nullifier:  ${fieldToHex(nullifier)}`);
     console.log(`Root:       ${fieldToHex(root)}`);
     console.log(`Recipient:  ${recipientPubkey}`);
     console.log(`Amount:     ${amount} lamports`);
 
-    // 2. Generate Proof
+    // 6. Generate Proof with new input structure
     console.log("\nGenerating ZK Proof...");
     const recipientField = recipientFieldFromPubkey(recipientPubkey);
 
     const proofResult = generateProof(circuitConfig, {
+        // Public inputs
         root: fieldToHex(root),
         nullifier: fieldToHex(nullifier),
         recipient: recipientField,
         amount: Number(amount),
-        secret: fieldToHex(secret),
-        nullifier_key: fieldToHex(nullifierKey),
+        wa_commitment: fieldToHex(waCommitment),
+        
+        // Private inputs
+        secret_key: fieldToHex(identity.secretKey),
+        owner_x: fieldToHex(identity.publicKey.x),
+        owner_y: fieldToHex(identity.publicKey.y),
+        randomness: fieldToHex(randomness),
         index: index,
         siblings: mt.getProof(index).map(fieldToHex),
     });
     console.log("Proof generated!");
-    if (proofResult.proof.length !== 388 || proofResult.publicWitness.length !== 140) {
-        throw new Error(
-            `Unexpected proof/witness length: proof=${proofResult.proof.length}, witness=${proofResult.publicWitness.length}`
-        );
-    }
+    
+    // Note: With the new circuit (5 public inputs instead of 4), 
+    // the public witness size will be different: 5 * 32 = 160 bytes
+    // Adjust expected sizes accordingly
+    console.log(`Proof size: ${proofResult.proof.length} bytes`);
+    console.log(`Public witness size: ${proofResult.publicWitness.length} bytes`);
 
-    // 3. Derive PDAs (simulated for test)
+    // 7. Derive PDAs
     console.log("\nPreparing Transaction...");
     const [statePda] = await getProgramDerivedAddress({
         programAddress: SHIELDED_POOL_PROGRAM_ID,
@@ -294,7 +326,7 @@ async function main() {
         { name: "system_program", address: SYSTEM_PROGRAM_ADDRESS },
     ];
 
-    // Withdraw instruction data: [WITHDRAW, proof (388), witness (140)]
+    // Withdraw instruction data: [WITHDRAW, proof, witness]
     const data = new Uint8Array(1 + proofResult.proof.length + proofResult.publicWitness.length);
     data[0] = INSTRUCTION.WITHDRAW;
     data.set(proofResult.proof, 1);

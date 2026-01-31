@@ -27,6 +27,17 @@ Shielded Pool (repo)
 
 Privacy comes from the ZK proof: the withdraw does not require the sender to sign, and the nullifier prevents double spend.
 
+### Commitment Scheme (BabyJubJub-based Auditable Identity)
+
+The circuit uses BabyJubJub-style elliptic curve for auditable identity:
+
+- `(owner_x, owner_y) = secret_key * G` - BabyJubJub public key derivation
+- `wa_commitment = Poseidon(owner_x, owner_y)` - Auditable identity for future RLWE audit module
+- `commitment = Poseidon(owner_x, owner_y, amount, randomness)` - Note commitment
+- `nullifier = Poseidon(secret_key, leaf_index)` - Double-spend prevention
+
+The `wa_commitment` is a public input that can be logged on-chain for audit purposes.
+
 #### Privacy Notes
 
 This is **not** a full anonymity system for SOL transfers on its own. Practical privacy depends on:
@@ -131,12 +142,12 @@ pnpm --dir client run test-shielded-pool
 
 - **Fee payer**: the relayer pays transaction fees for initialize/withdraw.  
 - **Sender privacy**: the sender signs only the deposit. Withdraw uses proof verification and nullifier checks instead of a sender signature.
-- **Proof size**: current proofs are 388 bytes, plus a 140-byte public witness.
+- **Proof size**: current proofs are 388 bytes, plus a 172-byte public witness (5 Field elements + 1 u64).
+- **Secret key constraint**: secret_key must be <= 128 bits for Noir's EmbeddedCurveScalar compatibility.
 
 ## Resources
 
 - [Noir Documentation](https://noir-lang.org/docs/)
 - [Sunspot Repository](https://github.com/reilabs/sunspot)
--  [Solana Noir Examples
-](https://github.com/solana-foundation/noir-examples)
+- [Solana Noir Examples](https://github.com/solana-foundation/noir-examples)
 - [Pinocchio Library](https://github.com/anza-xyz/pinocchio)

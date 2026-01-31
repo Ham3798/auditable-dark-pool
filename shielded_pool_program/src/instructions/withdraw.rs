@@ -17,7 +17,7 @@ const WITNESS_LEN: usize = WITNESS_HEADER_LEN + (PUBLIC_INPUTS * 32);
 
 /// ZK Verifier program ID
 pub const ZK_VERIFIER_PROGRAM_ID: Address =
-    Address::from_str_const("AvND3W6TkZ9AenvsAyuPKSPSgLWZYmY2SPfb5T51pb7V");
+    Address::from_str_const("92VLc7jbH1DcRH4e7tdh7nSwUbKqFDf5VSPk9EdnBMxC");
 
 pub fn process_withdraw(accounts: &[AccountView], data: &[u8]) -> ProgramResult {
     let [payer, recipient, vault, state_account, nullifier_account, zk_verifier, _system_program] =

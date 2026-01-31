@@ -1,4 +1,6 @@
 import { buildPoseidon, type Poseidon } from "circomlibjs";
+import { Field } from "@noble/curves/abstract/modular.js";
+import { weierstrass, type WeierstrassPoint } from "@noble/curves/abstract/weierstrass.js";
 
 let poseidonInstance: Poseidon | null = null;
 
@@ -28,6 +30,118 @@ export function poseidonHash3(v1: bigint, v2: bigint, v3: bigint): bigint {
     const hash = poseidon([v1, v2, v3]);
     return poseidon.F.toObject(hash) as bigint;
 }
+
+export function poseidonHash4(v1: bigint, v2: bigint, v3: bigint, v4: bigint): bigint {
+    const poseidon = getPoseidon();
+    const hash = poseidon([v1, v2, v3, v4]);
+    return poseidon.F.toObject(hash) as bigint;
+}
+
+// ============================================
+// BabyJubJub Curve (BN254's embedded curve)
+// ============================================
+
+// BabyJubJub curve parameters
+// p (base field) = BN254's scalar field order
+// n (scalar field) = BN254's base field order
+const BABYJUBJUB_P = BigInt("21888242871839275222246405745257275088548364400416034343698204186575808495617");
+const BABYJUBJUB_N = BigInt("21888242871839275222246405745257275088696311157297823662689037894645226208583");
+
+// Create the field
+const BabyJubJubFp = Field(BABYJUBJUB_P);
+
+// b = -17 mod p
+const BABYJUBJUB_B = BabyJubJubFp.neg(17n);
+
+// Generator point coordinates
+const BABYJUBJUB_GX = 1n;
+const BABYJUBJUB_GY = BigInt("17631683881184975370165255887551781615748388533673675138860");
+
+// Define BabyJubJub curve using noble-curves
+const BabyJubJubCurve = weierstrass(
+    {
+        p: BABYJUBJUB_P,
+        n: BABYJUBJUB_N,
+        h: 1n,
+        a: 0n,
+        b: BABYJUBJUB_B,
+        Gx: BABYJUBJUB_GX,
+        Gy: BABYJUBJUB_GY,
+    },
+    {
+        Fp: BabyJubJubFp,
+    }
+);
+
+export type BabyJubJubPoint = WeierstrassPoint<bigint>;
+
+// ============================================
+// BabyJubJub-style Identity Functions
+// ============================================
+
+export interface IdentityKeypair {
+    secretKey: bigint;
+    publicKey: {
+        x: bigint;
+        y: bigint;
+    };
+}
+
+// Max 128-bit value (for EmbeddedCurveScalar compatibility)
+const MAX_128_BIT = (1n << 128n) - 1n;
+
+/**
+ * Generate a new identity keypair
+ * secretKey is a random scalar, publicKey = secretKey * G
+ * Note: secretKey must be <= 128 bits for Noir's EmbeddedCurveScalar compatibility
+ */
+export function generateIdentityKeypair(secretKey: bigint): IdentityKeypair {
+    // Ensure secretKey is in valid range and fits in 128 bits
+    // This is required because Noir's EmbeddedCurveScalar uses lo/hi 128-bit limbs
+    const sk = secretKey % (MAX_128_BIT + 1n);
+    
+    // Compute public key: secretKey * G (using BASE which is the generator)
+    const pk = BabyJubJubCurve.BASE.multiply(sk);
+    
+    return {
+        secretKey: sk,
+        publicKey: {
+            x: pk.x,
+            y: pk.y,
+        },
+    };
+}
+
+/**
+ * Calculate wa_commitment = Poseidon(owner_x, owner_y)
+ * This is the auditable identity commitment
+ */
+export function calculateWaCommitment(publicKey: { x: bigint; y: bigint }): bigint {
+    return poseidonHash2(publicKey.x, publicKey.y);
+}
+
+/**
+ * Calculate commitment = Poseidon(owner_x, owner_y, amount, randomness)
+ * New commitment scheme with BabyJubJub identity
+ */
+export function calculateCommitment(
+    publicKey: { x: bigint; y: bigint },
+    amount: bigint,
+    randomness: bigint
+): bigint {
+    return poseidonHash4(publicKey.x, publicKey.y, amount, randomness);
+}
+
+/**
+ * Calculate nullifier = Poseidon(secret_key, leaf_index)
+ */
+export function calculateNullifier(secretKey: bigint, leafIndex: bigint): bigint {
+    return poseidonHash2(secretKey, leafIndex);
+}
+
+// ============================================
+// Merkle Tree Implementation
+// ============================================
 
 export class ShieldedPoolMerkleTree {
     private leaves: bigint[] = [];
