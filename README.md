@@ -14,6 +14,11 @@ Submission for [Solana Privacy Hack](https://solana.com/privacyhack) (Jan 12 –
 - **Noir (Aztec):** Used to write ZK circuits (`noir_circuit` for withdrawal, `audit_circuit` for compliance proof).
 - **Sunspot (Reilabs):** Utilized for compiling Noir circuits into Solana-compatible verifiers and generating proofs via the Go wrapper.
 
+## 🪿 URLs
+- Presentation Video: {승환님이 채우기}
+- Demo: https://zk-rlwe-pool-solana.vercel.app/
+- Demo Video: https://www.youtube.com/watch?v=N5k82fqNOAk
+
 ## Track
 
 **Track — Private payments**  
@@ -26,9 +31,6 @@ This project also qualifies for the following sponsor bounties:
 - **Aztec** — ZK with Noir
 - **Quicknode** — Public Benefit Prize
 - **Range** — Compliant Privacy
-
-## Demo 🪿
-https://zk-rlwe-pool-solana.vercel.app/
 
 
 ## Team
