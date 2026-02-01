@@ -550,35 +550,53 @@ npx tsx generate-proof-hex.ts`;
     setTimeout(() => setCopiedKey(null), 2000);
   }, []);
 
+  // Helper to pack values for ct_helper and audit circuits
+  const packCiphertextValues = useCallback((hexArr: string[]): string[] => {
+    const PACK_WIDTH = 7;
+    const PACK_BITS = 32n;
+    const packed: string[] = [];
+    for (let i = 0; i < hexArr.length; i += PACK_WIDTH) {
+      let v = 0n;
+      for (let j = 0; j < PACK_WIDTH && i + j < hexArr.length; j++) {
+        const coeff = BigInt(hexArr[i + j]) % 167772161n;
+        v += coeff << (BigInt(j) * PACK_BITS);
+      }
+      packed.push('"0x' + v.toString(16).padStart(64, "0") + '"');
+    }
+    return packed;
+  }, []);
+
+  const generateCtHelperToml = useCallback(
+    (deposit: DepositRecord) => {
+      if (!deposit.rlweCiphertext) return "# RLWE data not available for this deposit";
+
+      const c0Packed = packCiphertextValues(deposit.rlweCiphertext.c0Sparse);
+      const c1Packed = packCiphertextValues(deposit.rlweCiphertext.c1);
+
+      return `# ct_helper Prover.toml - Run this first to compute ct_commitment
+# Copy to ct_helper/Prover.toml, then run: nargo execute
+c0_packed = [${c0Packed.join(", ")}]
+c1_packed = [${c1Packed.join(", ")}]
+`;
+    },
+    [packCiphertextValues]
+  );
+
   const generateAuditToml = useCallback(
     (deposit: DepositRecord) => {
       if (!deposit.rlweCiphertext || !deposit.rlweNoise || !deposit.rlweQuotients) {
         return "# RLWE data not available for this deposit";
       }
-      // Pack 7 values per Field (32-bit each) to match circuit
-      const PACK_WIDTH = 7;
-      const PACK_BITS = 32n;
-      const packValues = (hexArr: string[]): string[] => {
-        const packed: string[] = [];
-        for (let i = 0; i < hexArr.length; i += PACK_WIDTH) {
-          let v = 0n;
-          for (let j = 0; j < PACK_WIDTH && i + j < hexArr.length; j++) {
-            const coeff = BigInt(hexArr[i + j]) % 167772161n;
-            v += coeff << (BigInt(j) * PACK_BITS);
-          }
-          packed.push("0x" + v.toString(16).padStart(64, "0"));
-        }
-        return packed;
-      };
-      const c0Packed = packValues(deposit.rlweCiphertext.c0Sparse);
-      const c1Packed = packValues(deposit.rlweCiphertext.c1);
+      const c0Packed = packCiphertextValues(deposit.rlweCiphertext.c0Sparse).map(s => s.slice(1, -1)); // Remove outer quotes
+      const c1Packed = packCiphertextValues(deposit.rlweCiphertext.c1).map(s => s.slice(1, -1));
 
       const q = (v: string) => `"${v}"`;
       const arr = (a: string[]) => `[${a.map(q).join(", ")}]`;
       let toml = `# Audit Prover.toml - Copy this to audit_circuit/Prover.toml\n`;
+      toml += `# IMPORTANT: Replace ct_commitment with the value from ct_helper!\n`;
       toml += `secret_key = ${q(deposit.secretKey)}\n`;
       toml += `wa_commitment = ${q(deposit.waCommitment)}\n`;
-      toml += `ct_commitment = ${deposit.ctCommitment ? q(deposit.ctCommitment) : '"0"'}\n`;
+      toml += `ct_commitment = "REPLACE_WITH_CT_HELPER_OUTPUT"\n`;
       toml += `c0_packed = ${arr(c0Packed)}\n`;
       toml += `c1_packed = ${arr(c1Packed)}\n`;
       toml += `r = ${arr(deposit.rlweNoise.r)}\n`;
@@ -588,7 +606,7 @@ npx tsx generate-proof-hex.ts`;
       toml += `k1 = ${arr(deposit.rlweQuotients.k1)}\n`;
       return toml;
     },
-    []
+    [packCiphertextValues]
   );
 
   const handleDecrypt = useCallback(async (deposit: DepositRecord) => {
@@ -756,7 +774,7 @@ npx tsx generate-proof-hex.ts`;
                 } else {
                   const isRecent = Date.now() - deposit.createdAt < 15000;
                   rootStatus = isRecent ? (
-                    <span className="text-xs text-blue-600">동기화 대기중...</span>
+                    <span className="text-xs text-blue-600">Syncing...</span>
                   ) : (
                     <span className="text-xs text-red-600">Root expired</span>
                   );
@@ -878,7 +896,7 @@ npx tsx generate-proof-hex.ts`;
           {rootValidation && !rootValidation.isValid && selectedDeposit && (
             Date.now() - selectedDeposit.createdAt < 15000 ? (
               <div className="rounded-lg bg-blue-100 border border-blue-200 px-4 py-3 text-sm text-blue-800">
-                온체인 동기화 대기중... 잠시 후 자동으로 업데이트됩니다.
+                Waiting for on-chain sync... Will update automatically.
               </div>
             ) : (
               <div className="rounded-lg bg-red-100 border border-red-200 px-4 py-3 text-sm text-red-800">
@@ -962,11 +980,52 @@ npx tsx generate-proof-hex.ts`;
             <p className="text-xs text-muted">nullifier: <span className="font-mono">{selectedDeposit.nullifier.slice(0, 22)}...</span></p>
           </div>
 
+          {/* Proof Generation Workflow Overview */}
+          <div className="rounded-lg border border-blue-600/30 bg-blue-900/10 p-4 space-y-3">
+            <h4 className="text-sm font-semibold text-blue-400">📋 Proof Generation Workflow</h4>
+            <ol className="text-xs text-gray-300 space-y-1 list-decimal list-inside">
+              <li><strong>Withdraw proof</strong> - Run in noir_circuit</li>
+              <li><strong>ct_commitment calculation</strong> - Run in ct_helper</li>
+              <li><strong>Audit proof</strong> - Run in audit_circuit</li>
+              <li><strong>Hex conversion</strong> - Run in client</li>
+            </ol>
+          </div>
+
+          {/* ct_helper Section */}
+          {selectedDeposit.rlweCiphertext && (
+            <div className="rounded-lg border border-yellow-600/30 bg-yellow-900/10 p-4 space-y-3">
+              <div className="flex items-center justify-between">
+                <h4 className="text-sm font-semibold text-yellow-400">Step 2-A: Compute ct_commitment</h4>
+                <button
+                  onClick={() => copyWithFeedback(generateCtHelperToml(selectedDeposit), "ct-helper-toml")}
+                  className="rounded bg-yellow-600 px-3 py-1 text-xs font-medium text-white hover:bg-yellow-500"
+                >
+                  {copiedKey === "ct-helper-toml" ? "Copied!" : "Copy ct_helper Prover.toml"}
+                </button>
+              </div>
+              <p className="text-xs text-gray-400">
+                You must compute ct_commitment before generating the audit proof.
+                Copy the content below to <code className="bg-gray-800 px-1 rounded">ct_helper/Prover.toml</code> and execute.
+              </p>
+              <pre className="overflow-x-auto rounded-lg bg-card p-3 text-xs font-mono max-h-24 border border-border-low">
+                {generateCtHelperToml(selectedDeposit)}
+              </pre>
+              <div className="rounded-lg bg-gray-900/50 p-3">
+                <pre className="text-xs text-green-400 whitespace-pre-wrap">{`cd ct_helper
+nargo execute
+
+# Check the return value in output:
+# Circuit output (pub return): 0x...
+# This value is the ct_commitment.`}</pre>
+              </div>
+            </div>
+          )}
+
           {/* Audit Prover.toml */}
           {selectedDeposit.rlweCiphertext && (
             <div className="space-y-2">
               <div className="flex items-center justify-between">
-                <p className="text-xs text-muted">Audit Prover.toml (RLWE encrypted):</p>
+                <p className="text-xs text-muted">Step 2-B: Audit Prover.toml (RLWE encrypted):</p>
                 <button
                   onClick={() => copyWithFeedback(generateAuditToml(selectedDeposit), "audit-toml")}
                   className="rounded bg-foreground px-3 py-1 text-xs font-medium text-background hover:opacity-90"
@@ -974,11 +1033,65 @@ npx tsx generate-proof-hex.ts`;
                   {copiedKey === "audit-toml" ? "Copied!" : "Copy Audit Prover.toml"}
                 </button>
               </div>
+              <div className="rounded-lg bg-orange-900/20 border border-orange-600/30 px-3 py-2 text-xs text-orange-300">
+                ⚠️ Replace the <strong>ct_commitment</strong> value with the one obtained from Step 2-A!
+              </div>
               <pre className="overflow-x-auto rounded-lg bg-card p-3 text-xs font-mono max-h-32">
-                {generateAuditToml(selectedDeposit).slice(0, 500)}...
+                {generateAuditToml(selectedDeposit).slice(0, 600)}...
               </pre>
             </div>
           )}
+
+          {/* Detailed Step-by-Step Commands */}
+          <div className="rounded-lg border border-border-low bg-gray-900/30 p-4 space-y-4">
+            <h4 className="text-sm font-semibold text-gray-300">📝 Detailed Execution Guide</h4>
+
+            <div className="space-y-1">
+              <span className="text-xs text-yellow-400 font-semibold">1. Generate Withdraw Proof</span>
+              <pre className="text-xs text-green-400 bg-gray-900 p-2 rounded whitespace-pre-wrap">{`cd noir_circuit
+# Paste Pool Prover.toml content into Prover.toml
+nargo execute
+sunspot prove target/shielded_pool_verifier.json \\
+  target/shielded_pool_verifier.gz \\
+  target/shielded_pool_verifier.ccs \\
+  target/shielded_pool_verifier.pk`}</pre>
+            </div>
+
+            <div className="space-y-1">
+              <span className="text-xs text-yellow-400 font-semibold">2. Compute ct_commitment</span>
+              <pre className="text-xs text-green-400 bg-gray-900 p-2 rounded whitespace-pre-wrap">{`cd ../ct_helper
+# Paste ct_helper Prover.toml content into Prover.toml
+nargo execute
+
+# Example output:
+# Circuit output (pub return): 0x1234...
+# ↑ Copy this value`}</pre>
+            </div>
+
+            <div className="space-y-1">
+              <span className="text-xs text-yellow-400 font-semibold">3. Generate Audit Proof</span>
+              <pre className="text-xs text-green-400 bg-gray-900 p-2 rounded whitespace-pre-wrap">{`cd ../audit_circuit
+# Paste Audit Prover.toml content into Prover.toml
+# ⚠️ Replace ct_commitment line with value from Step 2!
+nargo execute
+sunspot prove target/rlwe_audit.json \\
+  target/rlwe_audit.gz \\
+  target/rlwe_audit.ccs \\
+  target/rlwe_audit.pk`}</pre>
+            </div>
+
+            <div className="space-y-1">
+              <span className="text-xs text-yellow-400 font-semibold">4. Convert to Hex</span>
+              <pre className="text-xs text-green-400 bg-gray-900 p-2 rounded whitespace-pre-wrap">{`cd ../client
+npx tsx generate-proof-hex.ts
+
+# Enter the 4 hex values output into Step 3:
+# - Withdraw Proof (hex)
+# - Withdraw Public Witness (hex)
+# - Audit Proof (hex)
+# - Audit Public Witness (hex)`}</pre>
+            </div>
+          </div>
 
           {/* Shamir Decrypt */}
           {selectedDeposit.rlweCiphertext && (
