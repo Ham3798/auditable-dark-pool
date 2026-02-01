@@ -3,14 +3,31 @@
 **One-line description**<br>
 Auditable dark pool on Solana: private SOL transfers with 2-of-3 auditable compliance via RLWE threshold decryption.
 
+Submission for [Solana Privacy Hack](https://solana.com/privacyhack) (Jan 12 – Feb 2, 2026).
 
+## Project Description
 
-**Track**
+**Solana Privacy Pool** is a compliance-first privacy solution enabling anonymous SOL transfers with an auditable "backdoor" for regulators. Unlike Tornado Cash, we implement a **2-of-3 Threshold Decryption** mechanism using RLWE encryption. While users maintain privacy from the public, designated auditors can recover transaction identities **if, and only if**, a threshold of auditors agree.
 
+## Sponsor Technologies Used
 
-**Sponsor bounties**
+- **Noir (Aztec):** Used to write ZK circuits (`noir_circuit` for withdrawal, `audit_circuit` for compliance proof).
+- **Sunspot (Reilabs):** Utilized for compiling Noir circuits into Solana-compatible verifiers and generating proofs via the Go wrapper.
 
-## Honk🪿
+## Track
+
+**Track — Private payments**  
+Build innovative solutions for confidential or private transfers on Solana.
+
+## Sponsor Bounties (applicable)
+
+This project also qualifies for the following sponsor bounties:
+
+- **Aztec** — ZK with Noir
+- **Quicknode** — Public Benefit Prize
+- **Range** — Compliant Privacy
+
+## Demo 🪿
 https://zk-rlwe-pool-solana.vercel.app/
 
 
