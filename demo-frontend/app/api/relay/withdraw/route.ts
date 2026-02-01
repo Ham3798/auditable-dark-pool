@@ -124,24 +124,57 @@ export async function POST(request: NextRequest) {
     const auditProofBytes = hexToBytes(auditProofHex);
     const auditWitnessBytes = hexToBytes(auditWitnessHex);
 
-    // Build instruction data: [WITHDRAW(2)] + [withdraw_proof] + [withdraw_witness] + [audit_proof] + [audit_witness]
+    // Build instructions
+    
+    // 1. Submit Audit Record
+    // Layout: [SUBMIT_AUDIT(3)][audit_proof][audit_witness]
+    // Witness contains wa_commitment at offset 12 (used for PDA derivation)
+    
+    // Extract wa_commitment from audit witness
+    // Audit Witness: [12 bytes header] + [32 bytes wa] + [32 bytes ct]
+    const AUDIT_WITNESS_HEADER = 12;
+    const waCommitmentBytes = auditWitnessBytes.slice(
+      AUDIT_WITNESS_HEADER,
+      AUDIT_WITNESS_HEADER + 32
+    );
+
+    const [auditRecordPda] = PublicKey.findProgramAddressSync(
+      [Buffer.from("audit"), waCommitmentBytes],
+      SHIELDED_POOL_PROGRAM_ID
+    );
+
+    const INSTRUCTION_SUBMIT_AUDIT = 3;
+    const auditDataLen = 1 + auditProofBytes.length + auditWitnessBytes.length;
+    const auditData = new Uint8Array(auditDataLen);
+    let auditOffset = 0;
+    auditData[auditOffset++] = INSTRUCTION_SUBMIT_AUDIT;
+    auditData.set(auditProofBytes, auditOffset); auditOffset += auditProofBytes.length;
+    auditData.set(auditWitnessBytes, auditOffset);
+
+    const submitAuditIx = new TransactionInstruction({
+      programId: SHIELDED_POOL_PROGRAM_ID,
+      keys: [
+        { pubkey: relayer.publicKey, isSigner: true, isWritable: true },
+        { pubkey: auditRecordPda, isSigner: false, isWritable: true },
+        { pubkey: AUDIT_VERIFIER_PROGRAM_ID, isSigner: false, isWritable: false },
+        { pubkey: SYSTEM_PROGRAM_ID, isSigner: false, isWritable: false },
+      ],
+      data: Buffer.from(auditData)
+    });
+
+    // 2. Withdraw
+    // Layout: [WITHDRAW(2)] + [withdraw_proof] + [withdraw_witness] (Audit proof removed)
     const INSTRUCTION_WITHDRAW = 2;
-    const dataLen =
+    const withdrawDataLen =
       1 +
       withdrawProofBytes.length +
-      withdrawWitnessBytes.length +
-      auditProofBytes.length +
-      auditWitnessBytes.length;
-    const data = new Uint8Array(dataLen);
+      withdrawWitnessBytes.length;
+    const withdrawData = new Uint8Array(withdrawDataLen);
     let offset = 0;
-    data[offset++] = INSTRUCTION_WITHDRAW;
-    data.set(withdrawProofBytes, offset);
+    withdrawData[offset++] = INSTRUCTION_WITHDRAW;
+    withdrawData.set(withdrawProofBytes, offset);
     offset += withdrawProofBytes.length;
-    data.set(withdrawWitnessBytes, offset);
-    offset += withdrawWitnessBytes.length;
-    data.set(auditProofBytes, offset);
-    offset += auditProofBytes.length;
-    data.set(auditWitnessBytes, offset);
+    withdrawData.set(withdrawWitnessBytes, offset);
 
     // Derive PDAs
     const [vaultPda] = PublicKey.findProgramAddressSync(
@@ -153,7 +186,8 @@ export async function POST(request: NextRequest) {
       SHIELDED_POOL_PROGRAM_ID
     );
 
-    // Build withdraw instruction with 8 accounts
+    // Build withdraw instruction with 8 accounts (updated)
+    // Keys: [payer, recipient, vault, state, nullifier, zk_verifier, audit_record, system_program]
     const withdrawIx = new TransactionInstruction({
       programId: SHIELDED_POOL_PROGRAM_ID,
       keys: [
@@ -172,16 +206,21 @@ export async function POST(request: NextRequest) {
         }, // nullifier
         { pubkey: ZK_VERIFIER_PROGRAM_ID, isSigner: false, isWritable: false }, // zk_verifier
         {
-          pubkey: AUDIT_VERIFIER_PROGRAM_ID,
+          pubkey: auditRecordPda,
           isSigner: false,
-          isWritable: false,
-        }, // audit_verifier
+          isWritable: false, // Read-only check in withdraw
+        }, // audit_record (New)
         { pubkey: SYSTEM_PROGRAM_ID, isSigner: false, isWritable: false }, // system_program
       ],
-      data: Buffer.from(data),
+      data: Buffer.from(withdrawData),
     });
 
-    // Build transaction with compute budget (Use Versioned Transaction with ALT)
+    // Send Transactions
+    // We send two separate transactions to ensure they fit and to avoid complex composition issues.
+    // However, for atomic-like behavior from user perspective, we chain them.
+    // If Audit fails (e.g. invalid proof), Withdraw won't run.
+    // If Audit succeeds (or already exists), Withdraw runs.
+
     // Fetch Address Lookup Table
     const lookupTableAccount = await connection
       .getAddressLookupTable(new PublicKey(LOOKUP_TABLE_ADDRESS))
@@ -192,44 +231,71 @@ export async function POST(request: NextRequest) {
     }
 
     // Get recent blockhash
-    const { blockhash } = await connection.getLatestBlockhash("finalized");
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("finalized");
 
-    // Build V0 Message
-    const messageV0 = new TransactionMessage({
+    // --- Tx 1: Submit Audit ---
+    console.log("Sending Audit Transaction...");
+    const auditMessageV0 = new TransactionMessage({
       payerKey: relayer.publicKey,
       recentBlockhash: blockhash,
       instructions: [
-        ComputeBudgetProgram.setComputeUnitLimit({ units: 1_200_000 }),
+        ComputeBudgetProgram.setComputeUnitLimit({ units: 1_000_000 }),
+        submitAuditIx,
+      ],
+    }).compileToV0Message([lookupTableAccount]);
+    
+    const auditTx = new VersionedTransaction(auditMessageV0);
+    auditTx.sign([relayer]);
+    
+    // We attempt to send. If it fails because account already exists, we proceed.
+    let auditSignature = "";
+    try {
+        auditSignature = await connection.sendTransaction(auditTx, {
+            skipPreflight: true, // We handle errors manually or let it fail if crucial
+        });
+        await connection.confirmTransaction({
+             signature: auditSignature,
+             blockhash,
+             lastValidBlockHeight
+        });
+        console.log("Audit confirmed:", auditSignature);
+    } catch (e) {
+        console.log("Audit transaction failed (might be already initialized):", e);
+        // We assume it might be "already initialized" and proceed to withdraw.
+        // If it failed for other reasons (invalid proof), Withdraw will fail anyway.
+    }
+
+    // --- Tx 2: Withdraw ---
+    console.log("Sending Withdraw Transaction...");
+    const withdrawMessageV0 = new TransactionMessage({
+      payerKey: relayer.publicKey,
+      recentBlockhash: blockhash,
+      instructions: [
+        ComputeBudgetProgram.setComputeUnitLimit({ units: 1_000_000 }),
         withdrawIx,
       ],
     }).compileToV0Message([lookupTableAccount]);
 
-    // Create Versioned Transaction
-    const tx = new VersionedTransaction(messageV0);
+    const withdrawTx = new VersionedTransaction(withdrawMessageV0);
+    withdrawTx.sign([relayer]);
 
-    // Sign
-    tx.sign([relayer]);
-
-    // Send
-    console.log("Sending transaction (Versioned with ALT)...");
-    const signature = await connection.sendTransaction(tx, {
-      skipPreflight: false,
-      preflightCommitment: "confirmed",
+    const withdrawSignature = await connection.sendTransaction(withdrawTx, {
+        skipPreflight: false,
+        preflightCommitment: "confirmed",
     });
 
-    // Confirm
-    const latestBlockhash = await connection.getLatestBlockhash();
     await connection.confirmTransaction({
-      signature,
-      blockhash: latestBlockhash.blockhash,
-      lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
+        signature: withdrawSignature,
+        blockhash,
+        lastValidBlockHeight
     });
 
-    console.log("Transaction confirmed:", signature);
+    console.log("Withdraw confirmed:", withdrawSignature);
 
     return NextResponse.json({
       success: true,
-      signature,
+      signature: withdrawSignature,
+      auditSignature: auditSignature,
       relayerAddress: relayer.publicKey.toBase58(),
       message: "Withdraw completed via relayer",
     });

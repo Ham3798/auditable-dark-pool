@@ -103,6 +103,7 @@ export function ShieldedPoolCard() {
   const [deposits, setDeposits] = useState<DepositRecord[]>([]);
   const [selectedDeposit, setSelectedDeposit] = useState<DepositRecord | null>(null);
   const [showCliInstructions, setShowCliInstructions] = useState(false);
+  const [showBackendSetup, setShowBackendSetup] = useState(false);
 
   // On-chain state
   const [onChainState, setOnChainState] = useState<OnChainState | null>(null);
@@ -513,32 +514,52 @@ export function ShieldedPoolCard() {
     return toml;
   }, [recipientAddress]);
 
-  // Generate full CLI commands
-  const generateCliCommands = useCallback(() => {
-    return `# Step 1: Install prerequisites (if not already done)
+  // Phase 0: Backend setup (run once per machine)
+  const generateBackendSetupCommands = useCallback(() => {
+    return `# Phase 0: Backend setup (run once)
 # Noir
 noirup -v 1.0.0-beta.13
 
-# Sunspot (must use commit 5fd6223 for Noir compatibility)
+# Sunspot (commit 5fd6223 for Noir compatibility)
 git clone https://github.com/reilabs/sunspot.git ~/sunspot
 cd ~/sunspot && git checkout 5fd6223
 cd go && go build -o sunspot .
 export PATH="$HOME/sunspot/go:$PATH"
 
-# Step 2: Clone repository (if not already done)
+# Repo (if not cloned)
 git clone https://github.com/Ham3798/shielded-pool-pinocchio-solana.git
-cd shielded-pool-pinocchio-solana
+cd shielded-pool-pinocchio-solana`;
+  }, []);
 
-# Step 3: Generate proof
-cd noir_circuit
-# Copy Prover.toml content from above to noir_circuit/Prover.toml
+  // Phase 2–4: Circuit execution + client
+  const generateCliCommands = useCallback(() => {
+    return `# After Phase 0 and Phase 1 (copy 3 Prover.toml files)
+
+# Phase 2-A: Compute ct_commitment (required for audit)
+cd ct_helper
+# Paste Prover.toml, then:
+nargo execute
+# Output 0x... is ct_commitment - replace in audit_circuit/Prover.toml
+
+# Phase 2-B: Withdraw proof
+cd ../noir_circuit
+# Paste Prover.toml, then:
 nargo execute
 sunspot prove target/shielded_pool_verifier.json \\
   target/shielded_pool_verifier.gz \\
   target/shielded_pool_verifier.ccs \\
   target/shielded_pool_verifier.pk
 
-# Step 4: Convert to hex
+# Phase 2-C: Audit proof (replace ct_commitment first)
+cd ../audit_circuit
+# Paste Prover.toml with ct_commitment from Phase 2-A output, then:
+nargo execute
+sunspot prove target/rlwe_audit.json \\
+  target/rlwe_audit.gz \\
+  target/rlwe_audit.ccs \\
+  target/rlwe_audit.pk
+
+# Phase 3: Hex conversion
 cd ../client
 npx tsx generate-proof-hex.ts`;
   }, []);
@@ -886,6 +907,38 @@ c1_packed = [${c1Packed.join(", ")}]
             </button>
           </div>
 
+          {/* Phase 0: Backend Setup (Once) - Collapsible */}
+          <div className="rounded-lg border border-slate-500/40 bg-slate-900/20 overflow-hidden">
+            <button
+              type="button"
+              onClick={() => setShowBackendSetup(!showBackendSetup)}
+              className="w-full flex items-center justify-between px-4 py-3 text-left hover:bg-slate-800/30 transition"
+            >
+              <span className="text-sm font-semibold text-slate-300">
+                Phase 0: Backend setup (once, export included)
+              </span>
+              <span className="text-slate-500">{showBackendSetup ? "v" : ">"}</span>
+            </button>
+            {showBackendSetup && (
+              <div className="border-t border-slate-600/50 p-4 space-y-2">
+                <p className="text-xs text-slate-400">
+                  Noir, Sunspot, PATH export. Run once per machine.
+                </p>
+                <div className="flex justify-end">
+                  <button
+                    onClick={() => copyWithFeedback(generateBackendSetupCommands(), "backend-setup")}
+                    className="rounded bg-slate-600 px-3 py-1 text-xs font-medium text-white hover:bg-slate-500"
+                  >
+                    {copiedKey === "backend-setup" ? "Copied!" : "Copy Backend Commands"}
+                  </button>
+                </div>
+                <pre className="overflow-x-auto rounded-lg bg-slate-950 p-3 text-xs font-mono text-green-400">
+                  {generateBackendSetupCommands()}
+                </pre>
+              </div>
+            )}
+          </div>
+
           {/* Root Status Warning */}
           {!onChainState && (
             <div className="rounded-lg bg-blue-100 border border-blue-200 px-4 py-3 text-sm text-blue-800">
@@ -924,36 +977,81 @@ c1_packed = [${c1Packed.join(", ")}]
               className="w-full rounded-lg border border-border-low bg-card px-4 py-2.5 text-xs font-mono outline-none transition placeholder:text-muted focus:border-foreground/30 disabled:cursor-not-allowed disabled:opacity-60"
             />
             <p className="text-xs text-muted">
-              Enter the recipient <strong>before</strong> copying Prover.toml. The proof is bound to this address.
+              Enter recipient before copying Prover.toml. Proof is bound to this address.
             </p>
           </div>
 
-          <div className="space-y-2">
-            <div className="flex items-center justify-between">
-              <p className="text-xs text-muted">1. Copy Prover.toml content:</p>
-              <button
-                onClick={() => copyWithFeedback(generateProverToml(selectedDeposit), "pool-toml")}
-                className="rounded bg-foreground px-3 py-1 text-xs font-medium text-background hover:opacity-90"
-              >
-                {copiedKey === "pool-toml" ? "Copied!" : "Copy Pool Prover.toml"}
-              </button>
+          {/* Phase 1: Prover.toml copy */}
+          <div className="rounded-lg border border-amber-600/30 bg-amber-900/10 p-4 space-y-3">
+            <h4 className="text-sm font-semibold text-amber-400">Phase 1: Copy Prover.toml</h4>
+            <p className="text-xs text-gray-400">
+              Copy each to the corresponding directory.
+            </p>
+            <div className="space-y-3">
+              <div className="space-y-1">
+                <div className="flex justify-between items-center">
+                  <span className="text-xs text-amber-300">1-A. noir_circuit/Prover.toml</span>
+                  <button
+                    onClick={() => copyWithFeedback(generateProverToml(selectedDeposit), "pool-toml")}
+                    className="rounded bg-foreground px-3 py-1 text-xs font-medium text-background hover:opacity-90"
+                  >
+                    {copiedKey === "pool-toml" ? "Copied!" : "Copy Pool"}
+                  </button>
+                </div>
+                <pre className="overflow-x-auto rounded-lg bg-card p-2 text-xs font-mono max-h-32">
+                  {generateProverToml(selectedDeposit)}
+                </pre>
+              </div>
+              {selectedDeposit.rlweCiphertext && (
+                <>
+                  <div className="space-y-1">
+                    <div className="flex justify-between items-center">
+                      <span className="text-xs text-amber-300">1-B. ct_helper/Prover.toml</span>
+                      <button
+                        onClick={() => copyWithFeedback(generateCtHelperToml(selectedDeposit), "ct-helper-toml")}
+                        className="rounded bg-yellow-600 px-3 py-1 text-xs font-medium text-white hover:bg-yellow-500"
+                      >
+                        {copiedKey === "ct-helper-toml" ? "Copied!" : "Copy ct_helper"}
+                      </button>
+                    </div>
+                    <pre className="overflow-x-auto rounded-lg bg-card p-2 text-xs font-mono max-h-20">
+                      {generateCtHelperToml(selectedDeposit)}
+                    </pre>
+                  </div>
+                  <div className="space-y-1">
+                    <div className="flex justify-between items-center">
+                      <span className="text-xs text-amber-300">1-C. audit_circuit/Prover.toml</span>
+                      <button
+                        onClick={() => copyWithFeedback(generateAuditToml(selectedDeposit), "audit-toml")}
+                        className="rounded bg-foreground px-3 py-1 text-xs font-medium text-background hover:opacity-90"
+                      >
+                        {copiedKey === "audit-toml" ? "Copied!" : "Copy Audit"}
+                      </button>
+                    </div>
+                    <div className="rounded bg-orange-900/20 border border-orange-600/30 px-2 py-1 text-xs text-orange-300">
+                      Replace ct_commitment after Phase 2-A.
+                    </div>
+                    <pre className="overflow-x-auto rounded-lg bg-card p-2 text-xs font-mono max-h-24">
+                      {generateAuditToml(selectedDeposit).slice(0, 500)}...
+                    </pre>
+                  </div>
+                </>
+              )}
             </div>
-            <pre className="overflow-x-auto rounded-lg bg-card p-3 text-xs font-mono max-h-48">
-              {generateProverToml(selectedDeposit)}
-            </pre>
           </div>
 
-          <div className="space-y-2">
-            <div className="flex items-center justify-between">
-              <p className="text-xs text-muted">2. Run commands in terminal:</p>
+          {/* Phase 2–3: Circuit execution + client */}
+          <div className="rounded-lg border border-emerald-600/30 bg-emerald-900/10 p-4 space-y-3">
+            <h4 className="text-sm font-semibold text-emerald-400">Phase 2–3: Circuit execution and client hex</h4>
+            <div className="flex justify-end">
               <button
                 onClick={() => copyWithFeedback(generateCliCommands(), "cli-cmds")}
-                className="rounded bg-foreground px-3 py-1 text-xs font-medium text-background hover:opacity-90"
+                className="rounded bg-emerald-600 px-3 py-1 text-xs font-medium text-white hover:bg-emerald-500"
               >
                 {copiedKey === "cli-cmds" ? "Copied!" : "Copy All Commands"}
               </button>
             </div>
-            <pre className="overflow-x-auto rounded-lg bg-card p-3 text-xs font-mono">
+            <pre className="overflow-x-auto rounded-lg bg-slate-950 p-3 text-xs font-mono text-green-400 whitespace-pre-wrap">
               {generateCliCommands()}
             </pre>
           </div>
@@ -982,115 +1080,15 @@ c1_packed = [${c1Packed.join(", ")}]
 
           {/* Proof Generation Workflow Overview */}
           <div className="rounded-lg border border-blue-600/30 bg-blue-900/10 p-4 space-y-3">
-            <h4 className="text-sm font-semibold text-blue-400">📋 Proof Generation Workflow</h4>
+            <h4 className="text-sm font-semibold text-blue-400">Execution order</h4>
             <ol className="text-xs text-gray-300 space-y-1 list-decimal list-inside">
-              <li><strong>Withdraw proof</strong> - Run in noir_circuit</li>
-              <li><strong>ct_commitment calculation</strong> - Run in ct_helper</li>
-              <li><strong>Audit proof</strong> - Run in audit_circuit</li>
-              <li><strong>Hex conversion</strong> - Run in client</li>
+              <li><strong>Phase 0</strong> – Backend setup (export, noirup, sunspot). Once.</li>
+              <li><strong>Phase 1</strong> – Copy 3 Prover.toml (noir_circuit, ct_helper, audit_circuit)</li>
+              <li><strong>Phase 2-A</strong> – ct_helper: nargo execute to get ct_commitment</li>
+              <li><strong>Phase 2-B</strong> – noir_circuit: nargo execute + sunspot prove</li>
+              <li><strong>Phase 2-C</strong> – audit_circuit: replace ct_commitment, then nargo execute + sunspot prove</li>
+              <li><strong>Phase 3</strong> – client: npx tsx generate-proof-hex.ts</li>
             </ol>
-          </div>
-
-          {/* ct_helper Section */}
-          {selectedDeposit.rlweCiphertext && (
-            <div className="rounded-lg border border-yellow-600/30 bg-yellow-900/10 p-4 space-y-3">
-              <div className="flex items-center justify-between">
-                <h4 className="text-sm font-semibold text-yellow-400">Step 2-A: Compute ct_commitment</h4>
-                <button
-                  onClick={() => copyWithFeedback(generateCtHelperToml(selectedDeposit), "ct-helper-toml")}
-                  className="rounded bg-yellow-600 px-3 py-1 text-xs font-medium text-white hover:bg-yellow-500"
-                >
-                  {copiedKey === "ct-helper-toml" ? "Copied!" : "Copy ct_helper Prover.toml"}
-                </button>
-              </div>
-              <p className="text-xs text-gray-400">
-                You must compute ct_commitment before generating the audit proof.
-                Copy the content below to <code className="bg-gray-800 px-1 rounded">ct_helper/Prover.toml</code> and execute.
-              </p>
-              <pre className="overflow-x-auto rounded-lg bg-card p-3 text-xs font-mono max-h-24 border border-border-low">
-                {generateCtHelperToml(selectedDeposit)}
-              </pre>
-              <div className="rounded-lg bg-gray-900/50 p-3">
-                <pre className="text-xs text-green-400 whitespace-pre-wrap">{`cd ct_helper
-nargo execute
-
-# Check the return value in output:
-# Circuit output (pub return): 0x...
-# This value is the ct_commitment.`}</pre>
-              </div>
-            </div>
-          )}
-
-          {/* Audit Prover.toml */}
-          {selectedDeposit.rlweCiphertext && (
-            <div className="space-y-2">
-              <div className="flex items-center justify-between">
-                <p className="text-xs text-muted">Step 2-B: Audit Prover.toml (RLWE encrypted):</p>
-                <button
-                  onClick={() => copyWithFeedback(generateAuditToml(selectedDeposit), "audit-toml")}
-                  className="rounded bg-foreground px-3 py-1 text-xs font-medium text-background hover:opacity-90"
-                >
-                  {copiedKey === "audit-toml" ? "Copied!" : "Copy Audit Prover.toml"}
-                </button>
-              </div>
-              <div className="rounded-lg bg-orange-900/20 border border-orange-600/30 px-3 py-2 text-xs text-orange-300">
-                ⚠️ Replace the <strong>ct_commitment</strong> value with the one obtained from Step 2-A!
-              </div>
-              <pre className="overflow-x-auto rounded-lg bg-card p-3 text-xs font-mono max-h-32">
-                {generateAuditToml(selectedDeposit).slice(0, 600)}...
-              </pre>
-            </div>
-          )}
-
-          {/* Detailed Step-by-Step Commands */}
-          <div className="rounded-lg border border-border-low bg-gray-900/30 p-4 space-y-4">
-            <h4 className="text-sm font-semibold text-gray-300">📝 Detailed Execution Guide</h4>
-
-            <div className="space-y-1">
-              <span className="text-xs text-yellow-400 font-semibold">1. Generate Withdraw Proof</span>
-              <pre className="text-xs text-green-400 bg-gray-900 p-2 rounded whitespace-pre-wrap">{`cd noir_circuit
-# Paste Pool Prover.toml content into Prover.toml
-nargo execute
-sunspot prove target/shielded_pool_verifier.json \\
-  target/shielded_pool_verifier.gz \\
-  target/shielded_pool_verifier.ccs \\
-  target/shielded_pool_verifier.pk`}</pre>
-            </div>
-
-            <div className="space-y-1">
-              <span className="text-xs text-yellow-400 font-semibold">2. Compute ct_commitment</span>
-              <pre className="text-xs text-green-400 bg-gray-900 p-2 rounded whitespace-pre-wrap">{`cd ../ct_helper
-# Paste ct_helper Prover.toml content into Prover.toml
-nargo execute
-
-# Example output:
-# Circuit output (pub return): 0x1234...
-# ↑ Copy this value`}</pre>
-            </div>
-
-            <div className="space-y-1">
-              <span className="text-xs text-yellow-400 font-semibold">3. Generate Audit Proof</span>
-              <pre className="text-xs text-green-400 bg-gray-900 p-2 rounded whitespace-pre-wrap">{`cd ../audit_circuit
-# Paste Audit Prover.toml content into Prover.toml
-# ⚠️ Replace ct_commitment line with value from Step 2!
-nargo execute
-sunspot prove target/rlwe_audit.json \\
-  target/rlwe_audit.gz \\
-  target/rlwe_audit.ccs \\
-  target/rlwe_audit.pk`}</pre>
-            </div>
-
-            <div className="space-y-1">
-              <span className="text-xs text-yellow-400 font-semibold">4. Convert to Hex</span>
-              <pre className="text-xs text-green-400 bg-gray-900 p-2 rounded whitespace-pre-wrap">{`cd ../client
-npx tsx generate-proof-hex.ts
-
-# Enter the 4 hex values output into Step 3:
-# - Withdraw Proof (hex)
-# - Withdraw Public Witness (hex)
-# - Audit Proof (hex)
-# - Audit Public Witness (hex)`}</pre>
-            </div>
           </div>
 
           {/* Shamir Decrypt */}
