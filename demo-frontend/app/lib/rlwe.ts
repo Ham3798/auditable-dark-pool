@@ -80,6 +80,43 @@ function negacyclicMulInt(
   return result;
 }
 
+/**
+ * Generate row k of negacyclic matrix for polynomial, coefficients mod q.
+ * Matches generate_audit.py's negacyclic_matrix_row_mod_q()
+ *
+ * For negacyclic convolution, the matrix row k is:
+ * row[j] = poly[k-j] if k-j >= 0 else (-poly[k-j+n]) % q
+ */
+function negacyclicMatrixRowModQ(
+  poly: bigint[],
+  k: number,
+  n: number,
+  q: bigint
+): bigint[] {
+  const row: bigint[] = new Array(n).fill(0n);
+  for (let j = 0; j < n; j++) {
+    const idx = k - j;
+    if (idx >= 0) {
+      row[j] = ((poly[idx] % q) + q) % q;
+    } else {
+      row[j] = (((-poly[idx + n]) % q) + q) % q;
+    }
+  }
+  return row;
+}
+
+/**
+ * Inner product over integers (not mod q).
+ * row values are in [0, q), r values are signed small integers.
+ */
+function innerProductInt(row: bigint[], r: number[]): bigint {
+  let sum = 0n;
+  for (let i = 0; i < row.length; i++) {
+    sum += row[i] * BigInt(r[i]);
+  }
+  return sum;
+}
+
 // Encode a BN254 field element to 8-bit byte slots (little-endian)
 export function encodeFieldToBytes(value: bigint, numBytes: number): number[] {
   const slots: number[] = [];
@@ -140,18 +177,28 @@ export async function rlweEncrypt(
   const e1ModQ = e1Signed.map((v) => mod(BigInt(v), RLWE_Q));
   const e2ModQ = e2Signed.map((v) => mod(BigInt(v), RLWE_Q));
 
-  // c0_sparse[i] = (b*r)[i] + e1[i] + DELTA*msg[i] mod q
-  const br = negacyclicMulModQ(pk.b, rModQ, N, RLWE_Q);
+  // c0_sparse[i] = inner_product(PK_B_ROW[i], r) + e1[i] + DELTA*msg[i] mod q
+  // Using inner product with negacyclic matrix row to match circuit verification
   const c0Sparse: bigint[] = [];
   for (let i = 0; i < MSG_SLOTS; i++) {
-    c0Sparse.push(mod(br[i] + e1ModQ[i] + DELTA * BigInt(msg[i]), RLWE_Q));
+    const row = negacyclicMatrixRowModQ(pk.b, i, N, RLWE_Q);
+    let ip = 0n;
+    for (let j = 0; j < N; j++) {
+      ip = ((ip + row[j] * rModQ[j]) % RLWE_Q + RLWE_Q) % RLWE_Q;
+    }
+    c0Sparse.push(mod(ip + e1ModQ[i] + DELTA * BigInt(msg[i]), RLWE_Q));
   }
 
-  // c1[i] = (a*r)[i] + e2[i] mod q
-  const ar = negacyclicMulModQ(pk.a, rModQ, N, RLWE_Q);
+  // c1[i] = inner_product(PK_A_ROW[i], r) + e2[i] mod q
+  // Using inner product with negacyclic matrix row to match circuit verification
   const c1: bigint[] = [];
   for (let i = 0; i < N; i++) {
-    c1.push(mod(ar[i] + e2ModQ[i], RLWE_Q));
+    const row = negacyclicMatrixRowModQ(pk.a, i, N, RLWE_Q);
+    let ip = 0n;
+    for (let j = 0; j < N; j++) {
+      ip = ((ip + row[j] * rModQ[j]) % RLWE_Q + RLWE_Q) % RLWE_Q;
+    }
+    c1.push(mod(ip + e2ModQ[i], RLWE_Q));
   }
 
   return { c0Sparse, c1, rSigned, e1Signed, e2Signed, msg };
@@ -171,34 +218,28 @@ export async function computeQuotients(
   msg: number[]
 ): Promise<QuotientResult> {
   const pk = await loadRlwePk();
-  const rBig = rSigned.map(BigInt);
 
-  // Compute b*r and a*r over integers (no mod q)
-  const brInt = negacyclicMulInt(pk.b.map(BigInt), rBig, N);
-  const arInt = negacyclicMulInt(pk.a.map(BigInt), rBig, N);
-
-  // k0[i] = (brInt[i] + e1[i] + DELTA*msg[i] - c0[i]) / Q
+  // k0 계산: inner_product(PK_B_ROWS[i], r) 방식
+  // This matches the circuit's verification: inner_product_const(PK_B_ROWS[i], r)
   const k0: bigint[] = [];
   for (let i = 0; i < MSG_SLOTS; i++) {
-    const fullVal = brInt[i] + BigInt(e1Signed[i]) + DELTA * BigInt(msg[i]);
-    const remainder = ((fullVal % RLWE_Q) + RLWE_Q) % RLWE_Q;
-    const k = (fullVal - remainder) / RLWE_Q;
-    // Verify
-    if (remainder !== c0Sparse[i]) {
-      console.error(`c0 mismatch at ${i}: ${remainder} != ${c0Sparse[i]}`);
-    }
+    const row = negacyclicMatrixRowModQ(pk.b, i, N, RLWE_Q);
+    const ipInt = innerProductInt(row, rSigned);
+    const fullVal = ipInt + BigInt(e1Signed[i]) + DELTA * BigInt(msg[i]);
+    const c0Val = c0Sparse[i];
+    const k = (fullVal - c0Val) / RLWE_Q;
     k0.push(k);
   }
 
-  // k1[i] = (arInt[i] + e2[i] - c1[i]) / Q
+  // k1 계산: inner_product(PK_A_ROWS[i], r) 방식
+  // This matches the circuit's verification: inner_product_const(PK_A_ROWS[i], r)
   const k1: bigint[] = [];
   for (let i = 0; i < N; i++) {
-    const fullVal = arInt[i] + BigInt(e2Signed[i]);
-    const remainder = ((fullVal % RLWE_Q) + RLWE_Q) % RLWE_Q;
-    const k = (fullVal - remainder) / RLWE_Q;
-    if (remainder !== c1[i]) {
-      console.error(`c1 mismatch at ${i}: ${remainder} != ${c1[i]}`);
-    }
+    const row = negacyclicMatrixRowModQ(pk.a, i, N, RLWE_Q);
+    const ipInt = innerProductInt(row, rSigned);
+    const fullVal = ipInt + BigInt(e2Signed[i]);
+    const c1Val = c1[i];
+    const k = (fullVal - c1Val) / RLWE_Q;
     k1.push(k);
   }
 
