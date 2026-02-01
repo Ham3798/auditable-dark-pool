@@ -1,0 +1,10 @@
+{
+  "N": 1024,
+  "q": 167772161,
+  "noise_bound": 3,
+  "plaintext_modulus": 256,
+  "delta": 655360,
+  "threshold": 2,
+  "num_shares": 3,
+  "field": "BN254"
+}

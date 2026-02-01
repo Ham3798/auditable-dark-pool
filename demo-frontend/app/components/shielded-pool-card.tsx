@@ -29,6 +29,7 @@ import {
   INSTRUCTION,
   LAMPORTS_PER_SOL,
   recipientFieldFromPubkey,
+  AUDIT_VERIFIER_PROGRAM_ID, // ## SH ##
 } from "../lib/shielded-pool";
 import {
   saveDeposit,
@@ -37,6 +38,8 @@ import {
   saveMerkleTreeState,
   getMerkleTreeState,
   createDepositRecord,
+  saveAuditLog,
+  getAllAuditLogs,
   type DepositRecord,
 } from "../lib/storage";
 import {
@@ -55,6 +58,13 @@ import {
   createErrorStatus,
   type StatusMessage,
 } from "../lib/errors";
+// ## SH START ##
+import {
+  rlweEncrypt,
+  computeQuotients,
+} from "../lib/rlwe";
+import { decryptFromShares } from "../lib/shamir";
+// ## SH END ##
 
 // Helper function to convert hex string to Uint8Array
 function hexToBytes(hex: string): Uint8Array {
@@ -84,6 +94,9 @@ export function ShieldedPoolCard() {
   const [stateAddress, setStateAddress] = useState<Address | null>(null);
   const [statusMessage, setStatusMessage] = useState<StatusMessage | null>(null);
   const [isPoseidonReady, setIsPoseidonReady] = useState(false);
+  // ## SH START ##
+  const [isProcessing, setIsProcessing] = useState(false); // covers full deposit/withdraw flow
+  // ## SH END ##
   const merkleTreeRef = useRef<ShieldedPoolMerkleTree | null>(null);
 
   // Deposits state
@@ -99,6 +112,27 @@ export function ShieldedPoolCard() {
   const [proofHex, setProofHex] = useState("");
   const [witnessHex, setWitnessHex] = useState("");
   const [recipientAddress, setRecipientAddress] = useState("");
+
+  // ## SH START ##
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const [decryptedIdentity, setDecryptedIdentity] = useState<{
+    ownerX: bigint;
+    ownerY: bigint;
+  } | null>(null);
+  const [isDecrypting, setIsDecrypting] = useState(false);
+  const [hoveredNullifier, setHoveredNullifier] = useState<string | null>(null);
+  const [auditProofHex, setAuditProofHex] = useState("");
+  const [auditWitnessHex, setAuditWitnessHex] = useState("");
+  const [auditLogs, setAuditLogs] = useState<{
+    nullifier: string;
+    waCommitment: string;
+    ctCommitment: string;
+    txSignature: string;
+    timestamp: number;
+    bjjX?: string;
+    bjjY?: string;
+  }[]>([]);
+  // ## SH END ##
 
   const walletAddress = wallet?.account.address;
   const rpcUrl = process.env.NEXT_PUBLIC_SOLANA_RPC_URL || "https://api.devnet.solana.com";
@@ -125,10 +159,21 @@ export function ShieldedPoolCard() {
     initPoseidon().then(() => setIsPoseidonReady(true));
   }, []);
 
-  // Load deposits from IndexedDB
+  // Load deposits and audit logs from IndexedDB
   useEffect(() => {
     if (isPoseidonReady) {
       getAllDeposits().then(setDeposits);
+      getAllAuditLogs().then((logs) =>
+        setAuditLogs(logs.map((l) => ({
+          nullifier: l.nullifier ?? "",
+          waCommitment: l.waCommitment,
+          ctCommitment: l.ctCommitment,
+          txSignature: l.txSignature,
+          timestamp: l.timestamp,
+          bjjX: l.bjjX,
+          bjjY: l.bjjY,
+        })))
+      );
     }
   }, [isPoseidonReady]);
 
@@ -192,6 +237,7 @@ export function ShieldedPoolCard() {
       setStatusMessage(createStatus("error", "Missing required fields"));
       return;
     }
+    setIsProcessing(true); // ## SH ##
 
     const merkleTree = await getMerkleTree();
     if (!merkleTree) {
@@ -261,16 +307,63 @@ export function ShieldedPoolCard() {
         txSignature: signature,
       });
 
+      // ## SH START ##
+      // RLWE encrypt (owner_x, owner_y) for audit
+      try {
+        setStatusMessage(createStatus("loading", "Encrypting identity (RLWE)..."));
+        const enc = await rlweEncrypt(identity.publicKey.x, identity.publicKey.y);
+        const quotients = await computeQuotients(
+          enc.c0Sparse, enc.c1, enc.rSigned, enc.e1Signed, enc.e2Signed, enc.msg
+        );
+        const fmtQ = (v: bigint) => {
+          const mod = ((v % 167772161n) + 167772161n) % 167772161n;
+          return "0x" + mod.toString(16).padStart(64, "0");
+        };
+        const fmtBn = (v: number | bigint) => {
+          const bn254p = 21888242871839275222246405745257275088548364400416034343698204186575808495617n;
+          const vb = ((BigInt(v) % bn254p) + bn254p) % bn254p;
+          if (vb === 0n) return "0x" + "0".padStart(64, "0");
+          return "0x" + vb.toString(16).padStart(64, "0");
+        };
+        depositRecord.rlweCiphertext = {
+          c0Sparse: enc.c0Sparse.map(fmtQ),
+          c1: enc.c1.map(fmtQ),
+        };
+        depositRecord.rlweNoise = {
+          r: enc.rSigned.map((v) => fmtBn(v)),
+          e1Sparse: enc.e1Signed.map((v) => fmtBn(v)),
+          e2: enc.e2Signed.map((v) => fmtBn(v)),
+        };
+        depositRecord.rlweQuotients = {
+          k0: quotients.k0.map((v) => fmtBn(v)),
+          k1: quotients.k1.map((v) => fmtBn(v)),
+        };
+      } catch (rlweErr) {
+        console.error("RLWE encryption failed (non-fatal):", rlweErr);
+      }
+      // ## SH END ##
+
       await saveDeposit(depositRecord);
 
       // Save merkle tree state
       const leaves = merkleTree.getLeaves().map(fieldToHex);
       await saveMerkleTreeState(leaves, fieldToHex(root));
 
-      // Refresh on-chain state to reflect the new root
+      // Refresh on-chain state to reflect the new root (delay for RPC propagation)
+      await new Promise((r) => setTimeout(r, 3000));
       const newState = await fetchShieldedPoolState(rpcUrl, stateAddress);
       if (newState) {
         setOnChainState(newState);
+      }
+      // Retry with increasing delays until root is found
+      for (const delay of [5000, 7000]) {
+        const curState = await fetchShieldedPoolState(rpcUrl, stateAddress);
+        if (curState) setOnChainState(curState);
+        if (curState && isRootValidFromHex(curState, fieldToHex(root)).isValid) break;
+        await new Promise((r) => setTimeout(r, delay));
+        const retryState = await fetchShieldedPoolState(rpcUrl, stateAddress);
+        if (retryState) setOnChainState(retryState);
+        if (retryState && isRootValidFromHex(retryState, fieldToHex(root)).isValid) break;
       }
 
       // Reload deposits
@@ -291,6 +384,8 @@ export function ShieldedPoolCard() {
     } catch (err) {
       console.error("Deposit failed:", err);
       setStatusMessage(createErrorStatus(err));
+    } finally {
+      setIsProcessing(false); // ## SH ##
     }
   }, [walletAddress, vaultAddress, stateAddress, amount, isPoseidonReady, send, getMerkleTree, rpcUrl]);
 
@@ -449,6 +544,133 @@ cd ../client
 npx tsx generate-proof-hex.ts`;
   }, []);
 
+  // ## SH START ##
+  const copyWithFeedback = useCallback((text: string, key: string) => {
+    navigator.clipboard.writeText(text);
+    setCopiedKey(key);
+    setTimeout(() => setCopiedKey(null), 2000);
+  }, []);
+
+  const generateAuditToml = useCallback(
+    (deposit: DepositRecord) => {
+      if (!deposit.rlweCiphertext || !deposit.rlweNoise || !deposit.rlweQuotients) {
+        return "# RLWE data not available for this deposit";
+      }
+      // Pack 7 values per Field (32-bit each) to match circuit
+      const PACK_WIDTH = 7;
+      const PACK_BITS = 32n;
+      const packValues = (hexArr: string[]): string[] => {
+        const packed: string[] = [];
+        for (let i = 0; i < hexArr.length; i += PACK_WIDTH) {
+          let v = 0n;
+          for (let j = 0; j < PACK_WIDTH && i + j < hexArr.length; j++) {
+            const coeff = BigInt(hexArr[i + j]) % 167772161n;
+            v += coeff << (BigInt(j) * PACK_BITS);
+          }
+          packed.push("0x" + v.toString(16).padStart(64, "0"));
+        }
+        return packed;
+      };
+      const c0Packed = packValues(deposit.rlweCiphertext.c0Sparse);
+      const c1Packed = packValues(deposit.rlweCiphertext.c1);
+
+      const q = (v: string) => `"${v}"`;
+      const arr = (a: string[]) => `[${a.map(q).join(", ")}]`;
+      let toml = `# Audit Prover.toml - Copy this to audit_circuit/Prover.toml\n`;
+      toml += `secret_key = ${q(deposit.secretKey)}\n`;
+      toml += `wa_commitment = ${q(deposit.waCommitment)}\n`;
+      toml += `ct_commitment = ${deposit.ctCommitment ? q(deposit.ctCommitment) : '"0"'}\n`;
+      toml += `c0_packed = ${arr(c0Packed)}\n`;
+      toml += `c1_packed = ${arr(c1Packed)}\n`;
+      toml += `r = ${arr(deposit.rlweNoise.r)}\n`;
+      toml += `e1_sparse = ${arr(deposit.rlweNoise.e1Sparse)}\n`;
+      toml += `e2 = ${arr(deposit.rlweNoise.e2)}\n`;
+      toml += `k0 = ${arr(deposit.rlweQuotients.k0)}\n`;
+      toml += `k1 = ${arr(deposit.rlweQuotients.k1)}\n`;
+      return toml;
+    },
+    []
+  );
+
+  const handleDecrypt = useCallback(async (deposit: DepositRecord) => {
+    if (!deposit.rlweCiphertext) return;
+    setIsDecrypting(true);
+    setDecryptedIdentity(null);
+    try {
+      const c0Sparse = deposit.rlweCiphertext.c0Sparse.map((h) => BigInt(h));
+      const c1 = deposit.rlweCiphertext.c1.map((h) => BigInt(h));
+      const result = await decryptFromShares(c0Sparse, c1);
+      setDecryptedIdentity(result);
+    } catch (err) {
+      console.error("Decrypt failed:", err);
+    } finally {
+      setIsDecrypting(false);
+    }
+  }, []);
+
+  const handleAuditProofSubmit = useCallback(async () => {
+    if (!walletAddress || !auditProofHex || !auditWitnessHex) {
+      setStatusMessage(createStatus("error", "Missing audit proof or witness hex"));
+      return;
+    }
+    try {
+      setStatusMessage(createStatus("loading", "Submitting audit proof..."));
+      if (!auditProofHex.startsWith("0x") || auditProofHex.length < 10) {
+        throw new ShieldedPoolError(ErrorCode.PROOF_PARSE_ERROR);
+      }
+      if (!auditWitnessHex.startsWith("0x") || auditWitnessHex.length < 10) {
+        throw new ShieldedPoolError(ErrorCode.WITNESS_PARSE_ERROR);
+      }
+      const proofBytes = hexToBytes(auditProofHex);
+      const witnessBytes = hexToBytes(auditWitnessHex);
+      const data = new Uint8Array(proofBytes.length + witnessBytes.length);
+      data.set(proofBytes, 0);
+      data.set(witnessBytes, proofBytes.length);
+
+      const auditIx = {
+        programAddress: AUDIT_VERIFIER_PROGRAM_ID,
+        accounts: [] as { address: typeof walletAddress; role: number }[],
+        data,
+      };
+
+      setStatusMessage(createStatus("loading", "Awaiting signature... (Audit ZK proof verification)"));
+      const signature = await send({
+        instructions: [
+          getSetComputeUnitLimitInstruction({ units: 1_000_000 }),
+          auditIx,
+        ],
+      });
+      // Extract wa_commitment and ct_commitment from public witness (12-byte header + 2×32 bytes)
+      const txSig = signature ?? "";
+      let waCommitmentHex = "N/A";
+      let ctCommitmentHex = "N/A";
+      if (witnessBytes.length >= 76) {
+        waCommitmentHex = "0x" + Array.from(witnessBytes.slice(12, 44)).map((b) => b.toString(16).padStart(2, "0")).join("");
+        ctCommitmentHex = "0x" + Array.from(witnessBytes.slice(44, 76)).map((b) => b.toString(16).padStart(2, "0")).join("");
+      }
+      const depForBjj = selectedDeposit || deposits.find((d) => d.status === "pending") || deposits[0];
+      const logEntry = {
+        nullifier: depForBjj?.nullifier ?? "",
+        waCommitment: waCommitmentHex,
+        ctCommitment: ctCommitmentHex,
+        txSignature: txSig,
+        timestamp: Date.now(),
+        bjjX: depForBjj?.publicKeyX ?? "",
+        bjjY: depForBjj?.publicKeyY ?? "",
+      };
+      setAuditLogs((prev) => [...prev, logEntry]);
+      saveAuditLog(logEntry).catch(console.error);
+      setStatusMessage(createStatus("success", `Audit proof verified on-chain! TX: ${txSig.slice(0, 20)}...`));
+      setAuditProofHex("");
+      setAuditWitnessHex("");
+    } catch (err) {
+      console.error("Audit proof submit failed:", err);
+      const error = parseTransactionError(err);
+      setStatusMessage(createErrorStatus(error));
+    }
+  }, [walletAddress, auditProofHex, auditWitnessHex, send, selectedDeposit]);
+  // ## SH END ##
+
   const pendingDeposits = deposits.filter((d) => d.status === "pending");
 
   if (walletStatus !== "connected") {
@@ -533,8 +755,15 @@ npx tsx generate-proof-hex.ts`;
                     <span className="text-xs text-green-600">Root valid (age: {age})</span>
                   );
                 } else {
-                  rootStatus = <span className="text-xs text-red-600">Root expired</span>;
+                  const isRecent = Date.now() - deposit.createdAt < 15000;
+                  rootStatus = isRecent ? (
+                    <span className="text-xs text-blue-600">동기화 대기중...</span>
+                  ) : (
+                    <span className="text-xs text-red-600">Root expired</span>
+                  );
                 }
+              } else {
+                rootStatus = <span className="text-xs text-blue-600">Preparing...</span>;
               }
               return (
                 <button
@@ -542,6 +771,7 @@ npx tsx generate-proof-hex.ts`;
                   onClick={() => {
                     setSelectedDeposit(isSelected ? null : deposit);
                     setShowCliInstructions(!isSelected);
+                    setDecryptedIdentity(null); // ## SH ##
                   }}
                   className={`w-full flex items-center justify-between px-4 py-3 text-left border-b border-border-low/50 last:border-0 transition hover:bg-cream/50 ${
                     isSelected ? "bg-cream" : ""
@@ -578,6 +808,11 @@ npx tsx generate-proof-hex.ts`;
                       <span className="ml-2 text-xs text-muted">
                         Index: {deposit.leafIndex}
                       </span>
+                      {/* ## SH START ## */}
+                      <span className="ml-2 text-xs text-muted font-mono">
+                        N: {deposit.nullifier.slice(0, 10)}...
+                      </span>
+                      {/* ## SH END ## */}
                     </div>
                   </div>
                   <div className="flex items-center gap-2">
@@ -609,10 +844,10 @@ npx tsx generate-proof-hex.ts`;
           />
           <button
             onClick={handleDeposit}
-            disabled={isSending || !amount || parseFloat(amount) < 0.001 || !isPoseidonReady}
+            disabled={isSending || isProcessing || !amount || parseFloat(amount) < 0.001 || !isPoseidonReady}
             className="rounded-lg bg-foreground px-5 py-2.5 text-sm font-medium text-background transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
           >
-            {isSending ? "Confirming..." : "Deposit"}
+            {isProcessing ? (isSending ? "Confirming TX..." : "Encrypting...") : "Deposit"}
           </button>
         </div>
         <p className="text-xs text-muted">
@@ -635,11 +870,23 @@ npx tsx generate-proof-hex.ts`;
           </div>
 
           {/* Root Status Warning */}
-          {rootValidation && !rootValidation.isValid && (
-            <div className="rounded-lg bg-red-100 border border-red-200 px-4 py-3 text-sm text-red-800">
-              <strong>Warning:</strong> This deposit&apos;s root has expired. You need to create a
-              new deposit.
+          {!onChainState && (
+            <div className="rounded-lg bg-blue-100 border border-blue-200 px-4 py-3 text-sm text-blue-800">
+              Preparing... Loading on-chain state.
             </div>
+          )}
+
+          {rootValidation && !rootValidation.isValid && selectedDeposit && (
+            Date.now() - selectedDeposit.createdAt < 15000 ? (
+              <div className="rounded-lg bg-blue-100 border border-blue-200 px-4 py-3 text-sm text-blue-800">
+                온체인 동기화 대기중... 잠시 후 자동으로 업데이트됩니다.
+              </div>
+            ) : (
+              <div className="rounded-lg bg-red-100 border border-red-200 px-4 py-3 text-sm text-red-800">
+                <strong>Warning:</strong> This deposit&apos;s root has expired. You need to create a
+                new deposit.
+              </div>
+            )
           )}
 
           {rootValidation && rootValidation.isValid && rootValidation.index !== null && onChainState && isRootNearExpiry(onChainState, rootValidation.index) && (
@@ -668,10 +915,10 @@ npx tsx generate-proof-hex.ts`;
             <div className="flex items-center justify-between">
               <p className="text-xs text-muted">1. Copy Prover.toml content:</p>
               <button
-                onClick={() => navigator.clipboard.writeText(generateProverToml(selectedDeposit))}
+                onClick={() => copyWithFeedback(generateProverToml(selectedDeposit), "pool-toml")}
                 className="rounded bg-foreground px-3 py-1 text-xs font-medium text-background hover:opacity-90"
               >
-                Copy Prover.toml
+                {copiedKey === "pool-toml" ? "Copied!" : "Copy Pool Prover.toml"}
               </button>
             </div>
             <pre className="overflow-x-auto rounded-lg bg-card p-3 text-xs font-mono max-h-48">
@@ -683,10 +930,10 @@ npx tsx generate-proof-hex.ts`;
             <div className="flex items-center justify-between">
               <p className="text-xs text-muted">2. Run commands in terminal:</p>
               <button
-                onClick={() => navigator.clipboard.writeText(generateCliCommands())}
+                onClick={() => copyWithFeedback(generateCliCommands(), "cli-cmds")}
                 className="rounded bg-foreground px-3 py-1 text-xs font-medium text-background hover:opacity-90"
               >
-                Copy All Commands
+                {copiedKey === "cli-cmds" ? "Copied!" : "Copy All Commands"}
               </button>
             </div>
             <pre className="overflow-x-auto rounded-lg bg-card p-3 text-xs font-mono">
@@ -702,6 +949,69 @@ npx tsx generate-proof-hex.ts`;
               <li>Node.js 18+ - For hex conversion script</li>
             </ul>
           </div>
+
+          {/* ## SH START ## */}
+          {/* BJJ Identity Display */}
+          <div className="rounded-lg border border-border-low bg-card p-3 space-y-2">
+            <p className="text-xs font-medium">BabyJubJub Identity (BJJ Pubkey)</p>
+            <div className="space-y-1">
+              <p className="text-xs text-muted">owner_x:</p>
+              <p className="font-mono text-xs break-all select-all">{selectedDeposit.publicKeyX}</p>
+              <p className="text-xs text-muted mt-1">owner_y:</p>
+              <p className="font-mono text-xs break-all select-all">{selectedDeposit.publicKeyY}</p>
+            </div>
+            <p className="text-xs text-muted">nullifier: <span className="font-mono">{selectedDeposit.nullifier.slice(0, 22)}...</span></p>
+          </div>
+
+          {/* Audit Prover.toml */}
+          {selectedDeposit.rlweCiphertext && (
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <p className="text-xs text-muted">Audit Prover.toml (RLWE encrypted):</p>
+                <button
+                  onClick={() => copyWithFeedback(generateAuditToml(selectedDeposit), "audit-toml")}
+                  className="rounded bg-foreground px-3 py-1 text-xs font-medium text-background hover:opacity-90"
+                >
+                  {copiedKey === "audit-toml" ? "Copied!" : "Copy Audit Prover.toml"}
+                </button>
+              </div>
+              <pre className="overflow-x-auto rounded-lg bg-card p-3 text-xs font-mono max-h-32">
+                {generateAuditToml(selectedDeposit).slice(0, 500)}...
+              </pre>
+            </div>
+          )}
+
+          {/* Shamir Decrypt */}
+          {selectedDeposit.rlweCiphertext && (
+            <div className="space-y-2 rounded-lg border border-border-low bg-card p-3">
+              <div className="flex items-center justify-between">
+                <p className="text-xs font-medium">Decrypt Identity (Shamir 2-of-3)</p>
+                <button
+                  onClick={() => handleDecrypt(selectedDeposit)}
+                  disabled={isDecrypting}
+                  className="rounded bg-foreground px-3 py-1 text-xs font-medium text-background hover:opacity-90 disabled:opacity-40"
+                >
+                  {isDecrypting ? "Decrypting..." : "Decrypt"}
+                </button>
+              </div>
+              {decryptedIdentity && (
+                <div className="space-y-1 rounded-lg bg-cream/30 p-2">
+                  <p className="text-xs text-muted">Recovered owner_x:</p>
+                  <p className="font-mono text-xs break-all">0x{decryptedIdentity.ownerX.toString(16).padStart(64, "0")}</p>
+                  <p className="text-xs text-muted mt-1">Recovered owner_y:</p>
+                  <p className="font-mono text-xs break-all">0x{decryptedIdentity.ownerY.toString(16).padStart(64, "0")}</p>
+                  <p className={`text-xs mt-1 font-medium ${
+                    "0x" + decryptedIdentity.ownerX.toString(16).padStart(64, "0") === selectedDeposit.publicKeyX
+                      ? "text-green-600" : "text-red-600"
+                  }`}>
+                    {("0x" + decryptedIdentity.ownerX.toString(16).padStart(64, "0")) === selectedDeposit.publicKeyX
+                      ? "Match confirmed" : "Mismatch!"}
+                  </p>
+                </div>
+              )}
+            </div>
+          )}
+          {/* ## SH END ## */}
         </div>
       )}
 
@@ -754,6 +1064,51 @@ npx tsx generate-proof-hex.ts`;
         </button>
       </div>
 
+      {/* ## SH START ## */}
+      {/* Audit Proof Submission */}
+      <div className="space-y-3 border-t border-border-low pt-4">
+        <p className="text-sm font-medium">
+          Step 4: Submit Audit Proof (Separate TX)
+          {auditLogs.length > 0 && <span className="ml-2 text-green-600">Verified</span>}
+        </p>
+
+        <div className="space-y-2">
+          <label className="text-xs text-muted">Audit Proof (hex):</label>
+          <textarea
+            placeholder="0x... (paste audit proof hex from CLI)"
+            value={auditProofHex}
+            onChange={(e) => setAuditProofHex(e.target.value)}
+            disabled={isSending}
+            rows={2}
+            className="w-full rounded-lg border border-border-low bg-card px-4 py-2.5 text-xs font-mono outline-none transition placeholder:text-muted focus:border-foreground/30 disabled:cursor-not-allowed disabled:opacity-60"
+          />
+        </div>
+
+        <div className="space-y-2">
+          <label className="text-xs text-muted">Audit Public Witness (hex):</label>
+          <textarea
+            placeholder="0x... (paste audit witness hex from CLI)"
+            value={auditWitnessHex}
+            onChange={(e) => setAuditWitnessHex(e.target.value)}
+            disabled={isSending}
+            rows={2}
+            className="w-full rounded-lg border border-border-low bg-card px-4 py-2.5 text-xs font-mono outline-none transition placeholder:text-muted focus:border-foreground/30 disabled:cursor-not-allowed disabled:opacity-60"
+          />
+        </div>
+
+        <button
+          onClick={handleAuditProofSubmit}
+          disabled={isSending || !auditProofHex || !auditWitnessHex}
+          className="w-full rounded-lg bg-foreground px-4 py-2.5 text-sm font-medium text-background transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
+        >
+          {isSending ? "Verifying Audit Proof..." : "Submit Audit Proof"}
+        </button>
+        <p className="text-xs text-muted">
+          Audit proof verifies RLWE encryption correctness on-chain via a separate verifier program.
+        </p>
+      </div>
+      {/* ## SH END ## */}
+
       {/* Status Message */}
       {statusMessage && (
         <div
@@ -775,7 +1130,7 @@ npx tsx generate-proof-hex.ts`;
               <thead>
                 <tr className="border-b border-border-low">
                   <th className="pb-2 text-left font-medium text-muted">Amount</th>
-                  <th className="pb-2 text-left font-medium text-muted">wa_commitment</th>
+                  <th className="pb-2 text-left font-medium text-muted">Nullifier</th>
                   <th className="pb-2 text-left font-medium text-muted">Date</th>
                 </tr>
               </thead>
@@ -783,18 +1138,87 @@ npx tsx generate-proof-hex.ts`;
                 {deposits
                   .filter((d) => d.status === "withdrawn")
                   .map((deposit) => (
-                    <tr key={deposit.id} className="border-b border-border-low/50">
+                    <tr
+                      key={deposit.id}
+                      className={`border-b border-border-low/50 transition-colors ${hoveredNullifier === deposit.nullifier ? "bg-blue-50" : ""}`}
+                      onMouseEnter={() => setHoveredNullifier(deposit.nullifier)}
+                      onMouseLeave={() => setHoveredNullifier(null)}
+                    >
                       <td className="py-2 font-mono">
                         {(Number(deposit.amount) / 1e9).toFixed(4)} SOL
                       </td>
                       <td className="py-2 font-mono text-muted">
-                        {deposit.waCommitment.slice(0, 22)}...
+                        {deposit.nullifier.slice(0, 22)}...
                       </td>
                       <td className="py-2 text-muted">
                         {new Date(deposit.createdAt).toLocaleDateString()}
                       </td>
                     </tr>
                   ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* Audit History — one row per withdrawn deposit */}
+      {deposits.filter((d) => d.status === "withdrawn").length > 0 && (
+        <div className="space-y-2 border-t border-border-low pt-4">
+          <p className="text-sm font-medium">Audit History</p>
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="border-b border-border-low">
+                  <th className="pb-2 text-left font-medium text-muted">Nullifier</th>
+                  <th className="pb-2 text-left font-medium text-muted">Audit Status</th>
+                  <th className="pb-2 text-left font-medium text-muted">TX</th>
+                  <th className="pb-2 text-left font-medium text-muted">Date</th>
+                  <th className="pb-2 text-left font-medium text-muted">BJJ Address</th>
+                </tr>
+              </thead>
+              <tbody>
+                {deposits
+                  .filter((d) => d.status === "withdrawn")
+                  .map((deposit) => {
+                    const auditLog = auditLogs.find((l) => l.nullifier === deposit.nullifier);
+                    return (
+                      <tr
+                        key={deposit.id}
+                        className={`border-b border-border-low/50 transition-colors ${hoveredNullifier === deposit.nullifier ? "bg-blue-50" : ""}`}
+                        onMouseEnter={() => setHoveredNullifier(deposit.nullifier)}
+                        onMouseLeave={() => setHoveredNullifier(null)}
+                      >
+                        <td className="py-2 font-mono text-muted">
+                          {deposit.nullifier.slice(0, 22)}...
+                        </td>
+                        <td className="py-2">
+                          {auditLog ? (
+                            <span className="text-xs text-green-600">Verified</span>
+                          ) : (
+                            <span className="text-xs text-orange-600">Pending</span>
+                          )}
+                        </td>
+                        <td className="py-2 font-mono text-muted">
+                          {auditLog ? auditLog.txSignature.slice(0, 14) + "..." : "-"}
+                        </td>
+                        <td className="py-2 text-muted">
+                          {new Date(deposit.createdAt).toLocaleDateString()}
+                        </td>
+                        <td className="py-2">
+                          <button
+                            className="text-xs text-blue-600 hover:underline"
+                            onClick={() => {
+                              alert(
+                                `BJJ Owner Address\n\nX: ${deposit.publicKeyX}\nY: ${deposit.publicKeyY}`
+                              );
+                            }}
+                          >
+                            Open
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
               </tbody>
             </table>
           </div>

@@ -24,8 +24,8 @@
   "private": true,
   "dependencies": {
     "@noble/curves": "^2.0.1",
-    "@solana/client": "^1.2.0",
     "@solana-program/compute-budget": "^0.11.0",
+    "@solana/client": "^1.2.0",
     "@solana/kit": "^5.1.0",
     "@solana/react-hooks": "^1.1.5",
     "circomlibjs": "^0.1.7",
@@ -44,6 +44,6 @@
     "eslint-config-next": "16.0.10",
     "prettier": "^3.6.2",
     "tailwindcss": "^4",
-    "typescript": "^5"
+    "typescript": "5.9.3"
   }
 }

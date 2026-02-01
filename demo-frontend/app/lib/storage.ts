@@ -24,6 +24,22 @@ export interface DepositRecord {
   status: DepositStatus;
   txSignature?: string;
   withdrawTxSignature?: string;
+  // ## SH START ##
+  rlweCiphertext?: {
+    c0Sparse: string[]; // 64 hex strings (mod Q)
+    c1: string[];       // 1024 hex strings (mod Q)
+  };
+  rlweNoise?: {
+    r: string[];        // 1024 (signed→BN254 hex)
+    e1Sparse: string[]; // 64
+    e2: string[];       // 1024
+  };
+  rlweQuotients?: {
+    k0: string[];       // 64
+    k1: string[];       // 1024
+  };
+  ctCommitment?: string;
+  // ## SH END ##
 }
 
 export interface MerkleTreeState {
@@ -31,6 +47,17 @@ export interface MerkleTreeState {
   leaves: string[];
   lastSyncedRoot: string;
   lastUpdated: number;
+}
+
+export interface AuditLogRecord {
+  id: number; // auto-increment
+  nullifier: string;
+  waCommitment: string;
+  ctCommitment: string;
+  txSignature: string;
+  timestamp: number;
+  bjjX?: string;
+  bjjY?: string;
 }
 
 // ============================================
@@ -50,10 +77,17 @@ interface ShieldedPoolDB extends DBSchema {
     key: string;
     value: MerkleTreeState;
   };
+  auditLogs: {
+    key: number;
+    value: AuditLogRecord;
+    indexes: {
+      "by-timestamp": number;
+    };
+  };
 }
 
 const DB_NAME = "shielded-pool-demo";
-const DB_VERSION = 1;
+const DB_VERSION = 3; // ## SH ## bumped for audit logs
 
 let dbInstance: IDBPDatabase<ShieldedPoolDB> | null = null;
 
@@ -78,6 +112,15 @@ async function getDB(): Promise<IDBPDatabase<ShieldedPoolDB>> {
       // Merkle tree state store
       if (!db.objectStoreNames.contains("merkleTree")) {
         db.createObjectStore("merkleTree", { keyPath: "id" });
+      }
+
+      // Audit logs store
+      if (!db.objectStoreNames.contains("auditLogs")) {
+        const auditStore = db.createObjectStore("auditLogs", {
+          keyPath: "id",
+          autoIncrement: true,
+        });
+        auditStore.createIndex("by-timestamp", "timestamp");
       }
     },
   });
@@ -160,6 +203,21 @@ export async function saveMerkleTreeState(
 export async function getMerkleTreeState(): Promise<MerkleTreeState | undefined> {
   const db = await getDB();
   return db.get("merkleTree", MERKLE_STATE_KEY);
+}
+
+// ============================================
+// Audit Log Operations
+// ============================================
+
+export async function saveAuditLog(log: Omit<AuditLogRecord, "id">): Promise<void> {
+  const db = await getDB();
+  await db.add("auditLogs", log as AuditLogRecord);
+}
+
+export async function getAllAuditLogs(): Promise<AuditLogRecord[]> {
+  const db = await getDB();
+  const logs = await db.getAllFromIndex("auditLogs", "by-timestamp");
+  return logs;
 }
 
 // ============================================

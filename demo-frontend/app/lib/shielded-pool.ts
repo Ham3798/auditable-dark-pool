@@ -9,6 +9,12 @@ export const ZK_VERIFIER_PROGRAM_ID =
   (process.env.NEXT_PUBLIC_ZK_VERIFIER_PROGRAM_ID as Address) ||
   ("3qfJCYMTnPwFgSX1T3Ncem6b5DphHtNoMmgyVeb52Yti" as Address);
 
+// ## SH START ##
+export const AUDIT_VERIFIER_PROGRAM_ID =
+  (process.env.NEXT_PUBLIC_AUDIT_VERIFIER_PROGRAM_ID as Address) ||
+  ("2A6wr286RiTEYXVjrqmU87xCNG6nusU5rM8ynSbvfdqb" as Address);
+// ## SH END ##
+
 export const SYSTEM_PROGRAM_ADDRESS =
   "11111111111111111111111111111111" as Address;
 
