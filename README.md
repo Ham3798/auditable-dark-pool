@@ -1,22 +1,17 @@
 # Auditable dark pool
 
-**One-line description**
+**One-line description**<br>
 Auditable dark pool on Solana: private SOL transfers with 2-of-3 auditable compliance via RLWE threshold decryption.
 
-**GitHub**
-https://github.com/Ham3798/shielded-pool-pinocchio-solana
-
-**Presentation video**
-
-
-**Live demo**
-https://zk-rlwe-pool-solana.vercel.app/
 
 
 **Track**
 
 
 **Sponsor bounties**
+
+## **Demo Page**
+- [Auditable Dark Pool](https://zk-rlwe-pool-solana.vercel.app/)
 
 
 ## Team
