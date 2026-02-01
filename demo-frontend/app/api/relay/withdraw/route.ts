@@ -7,6 +7,8 @@ import {
   ComputeBudgetProgram,
   TransactionInstruction,
   sendAndConfirmTransaction,
+  VersionedTransaction,
+  TransactionMessage,
 } from "@solana/web3.js";
 import * as fs from "fs";
 import * as path from "path";
@@ -16,6 +18,11 @@ const RELAYER_SECRET_KEY = process.env.RELAYER_SECRET_KEY;
 const RELAYER_KEYPAIR_PATH = process.env.RELAYER_KEYPAIR_PATH;
 const RPC_URL =
   process.env.NEXT_PUBLIC_SOLANA_RPC_URL || "https://api.devnet.solana.com";
+
+// Address Lookup Table (ALT) for transaction compression
+const LOOKUP_TABLE_ADDRESS =
+  process.env.LOOKUP_TABLE_ADDRESS ||
+  "9Q7GoBP5Y1TBMbyfNpszzeL3azWbeW3FHzmbwH39YTPt";
 
 // Program IDs
 const SHIELDED_POOL_PROGRAM_ID = new PublicKey(
@@ -177,20 +184,48 @@ export async function POST(request: NextRequest) {
       data: Buffer.from(data),
     });
 
-    // Build transaction with compute budget
-    const tx = new Transaction();
-    tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 1_200_000 }));
-    tx.add(withdrawIx);
+    // Build transaction with compute budget (Use Versioned Transaction with ALT)
+    // Fetch Address Lookup Table
+    const lookupTableAccount = await connection
+      .getAddressLookupTable(new PublicKey(LOOKUP_TABLE_ADDRESS))
+      .then((res) => res.value);
+
+    if (!lookupTableAccount) {
+      throw new Error(`Address Lookup Table not found: ${LOOKUP_TABLE_ADDRESS}`);
+    }
 
     // Get recent blockhash
     const { blockhash } = await connection.getLatestBlockhash("finalized");
-    tx.recentBlockhash = blockhash;
-    tx.feePayer = relayer.publicKey;
 
-    // Sign and send
-    console.log("Sending transaction...");
-    const signature = await sendAndConfirmTransaction(connection, tx, [relayer], {
-      commitment: "confirmed",
+    // Build V0 Message
+    const messageV0 = new TransactionMessage({
+      payerKey: relayer.publicKey,
+      recentBlockhash: blockhash,
+      instructions: [
+        ComputeBudgetProgram.setComputeUnitLimit({ units: 1_200_000 }),
+        withdrawIx,
+      ],
+    }).compileToV0Message([lookupTableAccount]);
+
+    // Create Versioned Transaction
+    const tx = new VersionedTransaction(messageV0);
+
+    // Sign
+    tx.sign([relayer]);
+
+    // Send
+    console.log("Sending transaction (Versioned with ALT)...");
+    const signature = await connection.sendTransaction(tx, {
+      skipPreflight: false,
+      preflightCommitment: "confirmed",
+    });
+
+    // Confirm
+    const latestBlockhash = await connection.getLatestBlockhash();
+    await connection.confirmTransaction({
+      signature,
+      blockhash: latestBlockhash.blockhash,
+      lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
     });
 
     console.log("Transaction confirmed:", signature);
