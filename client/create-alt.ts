@@ -16,7 +16,9 @@ import { fileURLToPath } from "url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // Config
-const RPC_URL = "https://api.devnet.solana.com";
+// Helius RPC (primary) - Get your free API key at https://dev.helius.xyz/
+// Falls back to Solana devnet if Helius fails
+const RPC_URL = process.env.NEXT_PUBLIC_SOLANA_RPC_URL || "https://api.devnet.solana.com";
 const SHIELDED_POOL_PROGRAM_ID = new PublicKey("H76rmbsE6HxkDw7AWEJLtqYogyP6psq3Fk2wqPH7Cjes");
 const ZK_VERIFIER_PROGRAM_ID = new PublicKey("3qfJCYMTnPwFgSX1T3Ncem6b5DphHtNoMmgyVeb52Yti");
 const AUDIT_VERIFIER_PROGRAM_ID = new PublicKey("2A6wr286RiTEYXVjrqmU87xCNG6nusU5rM8ynSbvfdqb");

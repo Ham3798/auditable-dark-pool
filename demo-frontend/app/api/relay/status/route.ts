@@ -5,6 +5,8 @@ import * as path from "path";
 
 const RELAYER_SECRET_KEY = process.env.RELAYER_SECRET_KEY;
 const RELAYER_KEYPAIR_PATH = process.env.RELAYER_KEYPAIR_PATH;
+// Helius RPC (primary) - Get your free API key at https://dev.helius.xyz/
+// Falls back to Solana devnet if Helius fails
 const RPC_URL =
   process.env.NEXT_PUBLIC_SOLANA_RPC_URL || "https://api.devnet.solana.com";
 

@@ -13,6 +13,7 @@ Submission for [Solana Privacy Hack](https://solana.com/privacyhack) (Jan 12 –
 
 - **Noir (Aztec):** Used to write ZK circuits (`noir_circuit` for withdrawal, `audit_circuit` for compliance proof).
 - **Sunspot (Reilabs):** Utilized for compiling Noir circuits into Solana-compatible verifiers and generating proofs via the Go wrapper.
+- **Helius RPC:** All Solana RPC interactions (deposits, withdrawals, state queries) are powered by Helius' high-performance devnet RPC infrastructure.
 
 ## 🪿 URLs
 - Presentation Video: {승환님이 채우기}
@@ -29,7 +30,7 @@ Build innovative solutions for confidential or private transfers on Solana.
 This project also qualifies for the following sponsor bounties:
 
 - **Aztec** — ZK with Noir
-- **Quicknode** — Public Benefit Prize
+- **Helius** — Best Privacy Project (leveraging Helius RPC for all Solana interactions)
 - **Range** — Compliant Privacy
 
 

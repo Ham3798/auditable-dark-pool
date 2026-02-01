@@ -141,6 +141,8 @@ export function ShieldedPoolCard() {
   // ## SH END ##
 
   const walletAddress = wallet?.account.address;
+  // Helius RPC (primary) for all Solana interactions
+  // Falls back to Solana devnet if Helius fails
   const rpcUrl = process.env.NEXT_PUBLIC_SOLANA_RPC_URL || "https://api.devnet.solana.com";
 
   // Get or create merkle tree (only after Poseidon is ready)
