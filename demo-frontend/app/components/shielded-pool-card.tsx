@@ -133,6 +133,11 @@ export function ShieldedPoolCard() {
     bjjX?: string;
     bjjY?: string;
   }[]>([]);
+  const [relayerStatus, setRelayerStatus] = useState<{
+    relayerAddress: string;
+    balanceSol: number;
+    lowBalance: boolean;
+  } | null>(null);
   // ## SH END ##
 
   const walletAddress = wallet?.account.address;
@@ -214,9 +219,33 @@ export function ShieldedPoolCard() {
     };
 
     fetchState();
-    const interval = setInterval(fetchState, 30000); // Every 30 seconds
+    const interval = setInterval(fetchState, 30000);
     return () => clearInterval(interval);
   }, [stateAddress, rpcUrl]);
+
+  // Fetch relayer status
+  useEffect(() => {
+    const fetchRelayer = async () => {
+      try {
+        const res = await fetch("/api/relay/status");
+        if (res.ok) {
+          const data = await res.json();
+          setRelayerStatus({
+            relayerAddress: data.relayerAddress,
+            balanceSol: data.balanceSol,
+            lowBalance: data.lowBalance,
+          });
+        } else {
+          setRelayerStatus(null);
+        }
+      } catch {
+        setRelayerStatus(null);
+      }
+    };
+    fetchRelayer();
+    const interval = setInterval(fetchRelayer, 60000);
+    return () => clearInterval(interval);
+  }, []);
 
   // Validate selected deposit's root
   useEffect(() => {
@@ -538,12 +567,14 @@ cd shielded-pool-pinocchio-solana`;
 # Phase 2-A: Compute ct_commitment (required for audit)
 cd ct_helper
 # Paste Prover.toml, then:
+nargo check
 nargo execute
 # Output 0x... is ct_commitment - replace in audit_circuit/Prover.toml
 
 # Phase 2-B: Withdraw proof
 cd ../noir_circuit
 # Paste Prover.toml, then:
+nargo check
 nargo execute
 sunspot prove target/shielded_pool_verifier.json \\
   target/shielded_pool_verifier.gz \\
@@ -553,6 +584,7 @@ sunspot prove target/shielded_pool_verifier.json \\
 # Phase 2-C: Audit proof (replace ct_commitment first)
 cd ../audit_circuit
 # Paste Prover.toml with ct_commitment from Phase 2-A output, then:
+nargo check
 nargo execute
 sunspot prove target/rlwe_audit.json \\
   target/rlwe_audit.gz \\
@@ -1084,9 +1116,9 @@ c1_packed = [${c1Packed.join(", ")}]
             <ol className="text-xs text-gray-300 space-y-1 list-decimal list-inside">
               <li><strong>Phase 0</strong> – Backend setup (export, noirup, sunspot). Once.</li>
               <li><strong>Phase 1</strong> – Copy 3 Prover.toml (noir_circuit, ct_helper, audit_circuit)</li>
-              <li><strong>Phase 2-A</strong> – ct_helper: nargo execute to get ct_commitment</li>
-              <li><strong>Phase 2-B</strong> – noir_circuit: nargo execute + sunspot prove</li>
-              <li><strong>Phase 2-C</strong> – audit_circuit: replace ct_commitment, then nargo execute + sunspot prove</li>
+              <li><strong>Phase 2-A</strong> – ct_helper: nargo check, nargo execute to get ct_commitment</li>
+              <li><strong>Phase 2-B</strong> – noir_circuit: nargo check, nargo execute + sunspot prove</li>
+              <li><strong>Phase 2-C</strong> – audit_circuit: replace ct_commitment, nargo check, nargo execute + sunspot prove</li>
               <li><strong>Phase 3</strong> – client: npx tsx generate-proof-hex.ts</li>
             </ol>
           </div>
@@ -1199,6 +1231,38 @@ c1_packed = [${c1Packed.join(", ")}]
         <p className="text-xs text-muted">
           Withdrawals are submitted via server relayer for privacy. Both ZK proof and audit proof are verified on-chain.
         </p>
+        <p className="text-xs text-muted">
+          <span className="text-red-600 font-medium">*</span> Relayer has no gas? Withdrawals will fail. Fund the address below to keep the service running.
+        </p>
+        {relayerStatus && (
+          <div className={`rounded-xl border p-4 ${relayerStatus.lowBalance ? "border-orange-300 bg-orange-50 dark:bg-orange-950/20" : "border-border-low bg-cream/30"}`}>
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <p className="text-xs uppercase tracking-wide text-muted">Relayer</p>
+                <p className="mt-1 font-mono text-sm truncate max-w-[240px]" title={relayerStatus.relayerAddress}>
+                  {relayerStatus.relayerAddress}
+                </p>
+                <p className="mt-1 text-lg font-semibold tabular-nums">
+                  {relayerStatus.balanceSol.toFixed(4)}{" "}
+                  <span className="text-sm font-normal text-muted">SOL</span>
+                </p>
+              </div>
+              <div className="flex flex-col items-end gap-1">
+                <button
+                  onClick={() => copyWithFeedback(relayerStatus.relayerAddress, "relayer-addr")}
+                  className="rounded bg-foreground px-3 py-1 text-xs font-medium text-background hover:opacity-90"
+                >
+                  {copiedKey === "relayer-addr" ? "Copied" : "Copy address"}
+                </button>
+                {relayerStatus.lowBalance && (
+                  <span className="text-xs font-medium text-orange-700 dark:text-orange-400">
+                    Low balance. Fund to enable withdrawals.
+                  </span>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Status Message */}
