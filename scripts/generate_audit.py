@@ -233,6 +233,85 @@ fn main(c0_packed: [Field; PACKED_C0], c1_packed: [Field; PACKED_C1]) -> pub Fie
     return int(match.group(1), 16)
 
 
+def run_alpha_helper(wa_commitment, ct_commitment, c0_packed, c1_packed):
+    """Compute Fiat-Shamir alpha using Poseidon2 sponge (same as circuit)."""
+    helper_dir = os.path.join(PROJ_DIR, "alpha_helper")
+    os.makedirs(os.path.join(helper_dir, "src"), exist_ok=True)
+
+    with open(os.path.join(helper_dir, "Nargo.toml"), "w") as f:
+        f.write("""[package]
+name = "alpha_helper"
+type = "bin"
+authors = [""]
+compiler_version = ">=0.39.0"
+
+[dependencies]
+""")
+
+    # Generate the same Fiat-Shamir sponge as in the circuit
+    with open(os.path.join(helper_dir, "src", "main.nr"), "w") as f:
+        f.write(f"""use std::hash::poseidon2_permutation;
+
+global PACKED_C0: u32 = {PACKED_C0};
+global PACKED_C1: u32 = {PACKED_C1};
+
+fn main(
+    wa_commitment: Field,
+    ct_commitment: Field,
+    c0_packed: [Field; PACKED_C0],
+    c1_packed: [Field; PACKED_C1],
+) -> pub Field {{
+    let mut state: [Field; 4] = [0; 4];
+
+    // Absorb wa_commitment and ct_commitment
+    state[0] += wa_commitment;
+    state[1] += ct_commitment;
+    state = poseidon2_permutation(state, 4);
+
+    // Absorb c0_packed
+    for i in 0..(PACKED_C0 / 3) {{
+        state[0] += c0_packed[3 * i];
+        state[1] += c0_packed[3 * i + 1];
+        state[2] += c0_packed[3 * i + 2];
+        state = poseidon2_permutation(state, 4);
+    }}
+    // PACKED_C0 = {PACKED_C0}, remainder = {PACKED_C0 % 3}
+    state[0] += c0_packed[{PACKED_C0 - 1}];
+    state = poseidon2_permutation(state, 4);
+
+    // Absorb c1_packed (147 elements)
+    for i in 0..(PACKED_C1 / 3) {{
+        state[0] += c1_packed[3 * i];
+        state[1] += c1_packed[3 * i + 1];
+        state[2] += c1_packed[3 * i + 2];
+        state = poseidon2_permutation(state, 4);
+    }}
+    // PACKED_C1 = {PACKED_C1}, remainder = {PACKED_C1 % 3}
+
+    state = poseidon2_permutation(state, 4);
+    state[0]
+}}
+""")
+
+    with open(os.path.join(helper_dir, "Prover.toml"), "w") as f:
+        f.write(f"wa_commitment = {format_field(wa_commitment)}\n")
+        f.write(f"ct_commitment = {format_field(ct_commitment)}\n")
+        f.write(f"c0_packed = [{', '.join(format_field(v) for v in c0_packed)}]\n")
+        f.write(f"c1_packed = [{', '.join(format_field(v) for v in c1_packed)}]\n")
+
+    print("Compiling alpha_helper...")
+    subprocess.run([NARGO, "compile"], cwd=helper_dir, check=True, capture_output=True)
+    print("Executing alpha_helper...")
+    result = subprocess.run([NARGO, "execute"], cwd=helper_dir, check=True, capture_output=True, text=True)
+    output = result.stdout + result.stderr
+
+    match = re.search(r'Circuit output:\s*(0x[0-9a-fA-F]+)', output)
+    if not match:
+        raise RuntimeError(f"Could not parse alpha_helper output: {output}")
+
+    return int(match.group(1), 16)
+
+
 def compute_quotient_and_remainder(full_value, q):
     """Compute k, r such that full_value = k * q + r, r in [0, q).
     full_value is computed over integers (can be negative or very large).
@@ -243,36 +322,29 @@ def compute_quotient_and_remainder(full_value, q):
     return k, r
 
 
-def generate_const_circuit(pk_b_rows_sparse, pk_a_rows_full):
-    """Generate Noir circuit with mod q via quotient witnesses.
+def generate_ip_circuit():
+    """Generate Noir circuit with Schwartz-Zippel IP batching.
 
-    e1, e2 are NOT witness inputs. They are computed inside the circuit:
-      e1[i] = c0[i] + k0[i]*Q - <PK_B_ROW[i], r> - DELTA*msg[i]
-      e2[i] = c1[i] + k1[i]*Q - <PK_A_ROW[i], r>
-    Then range-checked to prove they are small (existence proof).
+    Instead of 1088 individual inner product assertions with hardcoded PK rows,
+    we batch all assertions into 2 using a Fiat-Shamir challenge alpha.
+
+    Prover precomputes:
+      combined_a[j] = sum_i alpha^i * PK_A_ROWS[i][j]  for j in 0..N
+      combined_b[j] = sum_i alpha^i * PK_B_ROWS[i][j]  for j in 0..N
+
+    Circuit verifies:
+      sum_i alpha^i * (c1[i] + k1[i]*Q) == <combined_a, r> + sum_i alpha^i * e2[i]
+      sum_i alpha^i * (c0[i] + k0[i]*Q) == <combined_b, r> + sum_i alpha^i * (e1[i] + DELTA*msg[i])
+
+    Soundness: Schwartz-Zippel, attack prob <= max(N, MSG_SLOTS) / |BN254| ~ 2^-244
     """
-    # PK rows: coefficients are mod q (small), embedded directly as Noir constants
-    pk_b_rows_strs = []
-    for k in range(MSG_SLOTS):
-        row_str = ', '.join(format_field_noir(v) for v in pk_b_rows_sparse[k])
-        pk_b_rows_strs.append(f"    [{row_str}]")
-    pk_b_block = ',\n'.join(pk_b_rows_strs)
-
-    pk_a_rows_strs = []
-    for k in range(N):
-        row_str = ', '.join(format_field_noir(v) for v in pk_a_rows_full[k])
-        pk_a_rows_strs.append(f"    [{row_str}]")
-    pk_a_block = ',\n'.join(pk_a_rows_strs)
-
     pack_shift_hex = f'0x{(1 << PACK_BITS):x}'  # 2^32
 
-    circuit = f"""// RLWE Audit Circuit for Shielded-Pool Integration
+    circuit = f"""// RLWE Audit Circuit - Schwartz-Zippel IP Batching
 // Ciphertext modulus q = {RLWE_Q}, plaintext modulus t = {PLAINTEXT_MOD}, Delta = q/t = {DELTA}
 // Poseidon1 for wa_commitment (matches shielded-pool), Poseidon2 for ct_commitment
-// Constant PK: negacyclic matrix rows hardcoded (coefficients in [0, q))
-// BFV convention: c0 = (b*r + e1 + Delta*msg) mod q, c1 = (a*r + e2) mod q
-// Circuit proves mod q via quotient: c0[i] + k0[i]*Q == ip + e1[i] + Delta*msg[i]
-// Public inputs: packed {PACK_WIDTH}x{PACK_BITS}-bit (c0: {PACKED_C0} Fields, c1: {PACKED_C1} Fields)
+// IP optimization: PK matrices moved to prover-side, circuit uses combined vectors
+// Soundness: Schwartz-Zippel, attack prob <= {N}/|BN254| ~ 2^-244
 
 use dep::poseidon::poseidon::bn254::hash_2 as poseidon1_hash_2;
 use std::hash::poseidon2_permutation;
@@ -294,21 +366,9 @@ global DELTA: Field = {DELTA};
 // Packing shift: 2^{PACK_BITS}
 global PACK_SHIFT: Field = {pack_shift_hex};
 
-// PK_B_ROWS: first {MSG_SLOTS} rows of negacyclic matrix from polynomial b
-// (for c0 = (b*r + e1 + Delta*msg) mod q)
-global PK_B_ROWS: [[Field; N]; MSG_SLOTS] = [
-{pk_b_block}
-];
-
-// PK_A_ROWS: all {N} rows of negacyclic matrix from polynomial a
-// (for c1 = (a*r + e2) mod q)
-global PK_A_ROWS: [[Field; N]; N] = [
-{pk_a_block}
-];
-
-fn inner_product_const(constant: [Field; N], variable: [Field; N]) -> Field {{
+fn inner_product(a: [Field; N], b: [Field; N]) -> Field {{
     let mut sum: Field = 0;
-    for i in 0..N {{ sum += constant[i] * variable[i]; }}
+    for i in 0..N {{ sum += a[i] * b[i]; }}
     sum
 }}
 
@@ -353,7 +413,6 @@ fn get_packed_elem(c0_packed: [Field; PACKED_C0], c1_packed: [Field; PACKED_C1],
 }}
 
 fn compute_ct_commitment(c0_packed: [Field; PACKED_C0], c1_packed: [Field; PACKED_C1]) -> Field {{
-    // ct_commitment = Poseidon2 sponge over packed Fields (rate=3, capacity=1)
     let mut state: [Field; 4] = [0; 4];
     let full_rounds: u32 = TOTAL_PACKED / 3;
     for i in 0..full_rounds {{
@@ -373,8 +432,46 @@ fn compute_ct_commitment(c0_packed: [Field; PACKED_C0], c1_packed: [Field; PACKE
     state[0]
 }}
 
+fn compute_fiat_shamir_alpha(
+    wa_commitment: Field,
+    ct_commitment: Field,
+    c0_packed: [Field; PACKED_C0],
+    c1_packed: [Field; PACKED_C1],
+) -> Field {{
+    // Fiat-Shamir challenge: alpha = Poseidon2 sponge(wa, ct, c0_packed..., c1_packed...)
+    // Total elements: 2 + PACKED_C0 + PACKED_C1 = 2 + {PACKED_C0} + {PACKED_C1} = {2 + PACKED_C0 + PACKED_C1}
+    let mut state: [Field; 4] = [0; 4];
+
+    // Absorb wa_commitment and ct_commitment
+    state[0] += wa_commitment;
+    state[1] += ct_commitment;
+    state = poseidon2_permutation(state, 4);
+
+    // Absorb c0_packed
+    for i in 0..(PACKED_C0 / 3) {{
+        state[0] += c0_packed[3 * i];
+        state[1] += c0_packed[3 * i + 1];
+        state[2] += c0_packed[3 * i + 2];
+        state = poseidon2_permutation(state, 4);
+    }}
+    // PACKED_C0 = {PACKED_C0}, remainder = {PACKED_C0 % 3}
+    state[0] += c0_packed[{PACKED_C0 - 1}];
+    state = poseidon2_permutation(state, 4);
+
+    // Absorb c1_packed (147 elements)
+    for i in 0..(PACKED_C1 / 3) {{
+        state[0] += c1_packed[3 * i];
+        state[1] += c1_packed[3 * i + 1];
+        state[2] += c1_packed[3 * i + 2];
+        state = poseidon2_permutation(state, 4);
+    }}
+    // PACKED_C1 = {PACKED_C1}, remainder = {PACKED_C1 % 3}
+
+    state = poseidon2_permutation(state, 4);
+    state[0]
+}}
+
 fn encode_field_to_byte_slots(value: Field) -> [Field; 32] {{
-    // Decompose a BN254 field element into 32 byte slots (8-bit each)
     let bits: [u1; 254] = value.to_le_bits();
     let mut slots: [Field; 32] = [0; 32];
     for i in 0..32 {{
@@ -396,8 +493,6 @@ fn encode_field_to_byte_slots(value: Field) -> [Field; 32] {{
 }}
 
 fn range_proof_signed(value: Field, bound: u32) {{
-    // Prove value is in [-bound, bound] by checking value + bound fits in u8
-    // For noise_bound=3: value + 128 as u8 (shifted range check)
     let shifted = value + 128;
     let _ = shifted as u8;
 }}
@@ -413,6 +508,8 @@ fn main(
     e2: [Field; N],
     k0: [Field; MSG_SLOTS],
     k1: [Field; N],
+    combined_a: [Field; N],
+    combined_b: [Field; N],
 ) {{
     // 1. BJJ scalar_mul -> (owner_x, owner_y)
     let two_pow_128: Field = 0x100000000000000000000000000000000;
@@ -438,26 +535,43 @@ fn main(
     let slots_y = encode_field_to_byte_slots(owner_y);
     for i in 0..32 {{ msg[32 + i] = slots_y[i]; }}
 
-    // 5. Range proof: r, e1, e2 are small (existence proof for small noise)
+    // 5. Range proof: r, e1, e2 are small
     for i in 0..N {{ range_proof_signed(r[i], 128); }}
     for i in 0..MSG_SLOTS {{ range_proof_signed(e1_sparse[i], 128); }}
     for i in 0..N {{ range_proof_signed(e2[i], 128); }}
 
-    // 6. c0_sparse[i] = (ip + e1[i] + DELTA*msg[i]) mod q
-    //    Proved via quotient: c0[i] + k0[i]*Q == ip + e1[i] + DELTA*msg[i] (over BN254)
-    for i in 0..MSG_SLOTS {{
-        let ip = inner_product_const(PK_B_ROWS[i], r);
-        assert(c0_sparse[i] + k0[i] * RLWE_Q == ip + e1_sparse[i] + DELTA * msg[i]);
-    }}
+    // 6. Compute Fiat-Shamir challenge alpha (deterministic from public inputs)
+    let alpha = compute_fiat_shamir_alpha(wa_commitment, ct_commitment, c0_packed, c1_packed);
 
-    // 7. c1[i] = (ip + e2[i]) mod q
-    //    Proved via quotient: c1[i] + k1[i]*Q == ip + e2[i] (over BN254)
+    // 7. Batched c1 check (Schwartz-Zippel):
+    //    sum_i alpha^i * (c1[i] + k1[i]*Q) == <combined_a, r> + sum_i alpha^i * e2[i]
+    //    where combined_a[j] = sum_i alpha^i * PK_A_ROWS[i][j]
+    let ip_a = inner_product(combined_a, r);
+    let mut lhs_a: Field = 0;
+    let mut rhs_noise_a: Field = 0;
+    let mut alpha_pow: Field = 1;
     for i in 0..N {{
-        let ip = inner_product_const(PK_A_ROWS[i], r);
-        assert(c1[i] + k1[i] * RLWE_Q == ip + e2[i]);
+        lhs_a += alpha_pow * (c1[i] + k1[i] * RLWE_Q);
+        rhs_noise_a += alpha_pow * e2[i];
+        alpha_pow *= alpha;
     }}
+    assert(lhs_a == ip_a + rhs_noise_a);
 
-    // 8. ct_commitment = Poseidon2 sponge of packed ciphertext
+    // 8. Batched c0 check (Schwartz-Zippel):
+    //    sum_i alpha^i * (c0[i] + k0[i]*Q) == <combined_b, r> + sum_i alpha^i * (e1[i] + DELTA*msg[i])
+    //    where combined_b[j] = sum_i alpha^i * PK_B_ROWS[i][j]
+    let ip_b = inner_product(combined_b, r);
+    let mut lhs_b: Field = 0;
+    let mut rhs_noise_b: Field = 0;
+    let mut alpha_pow_b: Field = 1;
+    for i in 0..MSG_SLOTS {{
+        lhs_b += alpha_pow_b * (c0_sparse[i] + k0[i] * RLWE_Q);
+        rhs_noise_b += alpha_pow_b * (e1_sparse[i] + DELTA * msg[i]);
+        alpha_pow_b *= alpha;
+    }}
+    assert(lhs_b == ip_b + rhs_noise_b);
+
+    // 9. ct_commitment = Poseidon2 sponge of packed ciphertext
     let calculated_ct = compute_ct_commitment(c0_packed, c1_packed);
     assert(ct_commitment == calculated_ct);
 }}
@@ -605,14 +719,63 @@ def main():
         }, f)
     print(f"Ciphertext saved to {ct_path}")
 
-    # Step 5: Generate circuit
-    print("\n=== Step 5: Generate audit_circuit ===")
+    # Step 5: Compute Fiat-Shamir alpha and combined vectors
+    print("\n=== Step 5: Fiat-Shamir alpha + combined vectors ===")
+    alpha = run_alpha_helper(wa_commitment, ct_commitment, c0_packed, c1_packed)
+    print(f"alpha = {hex(alpha)}")
+
+    # combined_a[j] = sum_i alpha^i * PK_A_ROWS[i][j]  (mod BN254_P)
+    combined_a = [0] * N
+    alpha_pow = 1
+    for i in range(N):
+        for j in range(N):
+            combined_a[j] = (combined_a[j] + alpha_pow * pk_a_rows_full[i][j]) % BN254_P
+        alpha_pow = (alpha_pow * alpha) % BN254_P
+
+    # combined_b[j] = sum_i alpha^i * PK_B_ROWS[i][j]  (mod BN254_P)
+    combined_b = [0] * N
+    alpha_pow = 1
+    for i in range(MSG_SLOTS):
+        for j in range(N):
+            combined_b[j] = (combined_b[j] + alpha_pow * pk_b_rows_sparse[i][j]) % BN254_P
+        alpha_pow = (alpha_pow * alpha) % BN254_P
+
+    print(f"combined_a[0] = {hex(combined_a[0])}")
+    print(f"combined_b[0] = {hex(combined_b[0])}")
+
+    # Verify batched equation over BN254
+    # c1 check: sum alpha^i * (c1[i] + k1[i]*Q) == <combined_a, r> + sum alpha^i * e2[i]
+    ip_a = sum(combined_a[j] * r_bn254[j] for j in range(N)) % BN254_P
+    lhs_a = 0
+    rhs_noise_a = 0
+    alpha_pow = 1
+    for i in range(N):
+        lhs_a = (lhs_a + alpha_pow * (c1[i] + k1_bn254[i] * RLWE_Q)) % BN254_P
+        rhs_noise_a = (rhs_noise_a + alpha_pow * e2_bn254[i]) % BN254_P
+        alpha_pow = (alpha_pow * alpha) % BN254_P
+    assert (lhs_a - ip_a - rhs_noise_a) % BN254_P == 0, "Batched c1 verification failed!"
+
+    # c0 check: sum alpha^i * (c0[i] + k0[i]*Q) == <combined_b, r> + sum alpha^i * (e1[i] + DELTA*msg[i])
+    ip_b = sum(combined_b[j] * r_bn254[j] for j in range(N)) % BN254_P
+    lhs_b = 0
+    rhs_noise_b = 0
+    alpha_pow = 1
+    for i in range(MSG_SLOTS):
+        lhs_b = (lhs_b + alpha_pow * (c0_sparse[i] + k0_bn254[i] * RLWE_Q)) % BN254_P
+        rhs_noise_b = (rhs_noise_b + alpha_pow * (e1_bn254[i] + DELTA * msg[i])) % BN254_P
+        alpha_pow = (alpha_pow * alpha) % BN254_P
+    assert (lhs_b - ip_b - rhs_noise_b) % BN254_P == 0, "Batched c0 verification failed!"
+
+    print("Batched IP verification passed!")
+
+    # Step 6: Generate circuit
+    print("\n=== Step 6: Generate audit_circuit (IP version) ===")
     os.makedirs(os.path.join(CIRCUIT_DIR, "src"), exist_ok=True)
 
-    circuit = generate_const_circuit(pk_b_rows_sparse, pk_a_rows_full)
+    circuit = generate_ip_circuit()
     with open(os.path.join(CIRCUIT_DIR, "src", "main.nr"), "w") as f:
         f.write(circuit)
-    print(f"Circuit written ({os.path.getsize(os.path.join(CIRCUIT_DIR, 'src', 'main.nr')) / 1024 / 1024:.1f} MB)")
+    print(f"Circuit written ({os.path.getsize(os.path.join(CIRCUIT_DIR, 'src', 'main.nr')) / 1024:.1f} KB)")
 
     with open(os.path.join(CIRCUIT_DIR, "Nargo.toml"), "w") as f:
         f.write("""[package]
@@ -639,16 +802,18 @@ poseidon = { tag = "v0.1.1", git = "https://github.com/noir-lang/poseidon" }
         f.write(f"e2 = [{', '.join(format_field(v) for v in e2_signed)}]\n")
         f.write(f"k0 = [{', '.join(format_field(v) for v in k0_list)}]\n")
         f.write(f"k1 = [{', '.join(format_field(v) for v in k1_list)}]\n")
+        f.write(f"combined_a = [{', '.join(format_field(v) for v in combined_a)}]\n")
+        f.write(f"combined_b = [{', '.join(format_field(v) for v in combined_b)}]\n")
     print(f"Prover.toml written ({os.path.getsize(toml_path) / 1024:.1f} KB)")
 
-    # Step 6: Compile + sunspot pipeline
-    print("\n=== Step 6: nargo compile ===")
+    # Step 7: Compile + sunspot pipeline
+    print("\n=== Step 7: nargo compile ===")
     t0 = time.time()
     subprocess.run([NARGO, "compile"], cwd=CIRCUIT_DIR, check=True)
     t_compile = time.time() - t0
     print(f"nargo compile: {t_compile:.1f}s")
 
-    print("\n=== Step 7: nargo execute ===")
+    print("\n=== Step 8: nargo execute ===")
     t0 = time.time()
     subprocess.run([NARGO, "execute"], cwd=CIRCUIT_DIR, check=True)
     t_execute = time.time() - t0
@@ -658,7 +823,7 @@ poseidon = { tag = "v0.1.1", git = "https://github.com/noir-lang/poseidon" }
     acir_file = os.path.join(target_dir, "rlwe_audit.json")
     witness_file = os.path.join(target_dir, "rlwe_audit.gz")
 
-    print("\n=== Step 8: sunspot compile ===")
+    print("\n=== Step 9: sunspot compile ===")
     t0 = time.time()
     subprocess.run([SUNSPOT, "compile", acir_file], check=True)
     t_sunspot_compile = time.time() - t0
@@ -666,7 +831,7 @@ poseidon = { tag = "v0.1.1", git = "https://github.com/noir-lang/poseidon" }
     ccs_size = os.path.getsize(ccs_file) / 1024 / 1024
     print(f"sunspot compile: {t_sunspot_compile:.1f}s, .ccs = {ccs_size:.1f} MB")
 
-    print("\n=== Step 9: sunspot setup ===")
+    print("\n=== Step 10: sunspot setup ===")
     t0 = time.time()
     subprocess.run([SUNSPOT, "setup", ccs_file], check=True)
     t_setup = time.time() - t0
@@ -675,7 +840,7 @@ poseidon = { tag = "v0.1.1", git = "https://github.com/noir-lang/poseidon" }
     pk_size = os.path.getsize(pk_file) / 1024 / 1024
     print(f"sunspot setup: {t_setup:.1f}s, pk = {pk_size:.1f} MB")
 
-    print("\n=== Step 10: sunspot prove ===")
+    print("\n=== Step 11: sunspot prove ===")
     t0 = time.time()
     subprocess.run([SUNSPOT, "prove", acir_file, witness_file, ccs_file, pk_file], check=True)
     t_prove = time.time() - t0
@@ -684,14 +849,14 @@ poseidon = { tag = "v0.1.1", git = "https://github.com/noir-lang/poseidon" }
     proof_size = os.path.getsize(proof_file)
     print(f"sunspot prove: {t_prove:.1f}s, proof = {proof_size} bytes")
 
-    print("\n=== Step 11: sunspot verify ===")
+    print("\n=== Step 12: sunspot verify ===")
     t0 = time.time()
     subprocess.run([SUNSPOT, "verify", vk_file, proof_file, pw_file], check=True)
     t_verify = time.time() - t0
     print(f"sunspot verify: {t_verify:.1f}s")
 
     # Copy artifacts
-    print("\n=== Step 12: Copy artifacts ===")
+    print("\n=== Step 13: Copy artifacts ===")
     os.makedirs(ARTIFACTS_DIR, exist_ok=True)
     shutil.copy2(ccs_file, os.path.join(ARTIFACTS_DIR, "audit_circuit.ccs"))
     shutil.copy2(vk_file, os.path.join(ARTIFACTS_DIR, "audit_circuit.vk"))

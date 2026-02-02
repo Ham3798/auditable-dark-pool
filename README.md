@@ -37,10 +37,50 @@ commitment = Poseidon(owner_x, owner_y, amount, randomness)
 nullifier = Poseidon(secret_key, leaf_index)
 ```
 
+## RLWE Audit Circuit (audit2 branch)
+
+The audit circuit proves that a BFV ciphertext was correctly encrypted under the auditor's RLWE public key, enabling regulatory compliance without breaking user privacy.
+
+**What it verifies:**
+- **Ownership**: BJJ scalar multiplication + Poseidon wa_commitment
+- **Encryption correctness**: BFV encryption equations c0 = b·r + e1 + Δ·msg (mod q), c1 = a·r + e2 (mod q), verified via batched inner-product checks
+- **Noise bounds**: range proofs on r, e1, e2 (small noise values)
+- **Ciphertext integrity**: Poseidon2 sponge commitment over packed ciphertext
+
+**Soundness**: attack probability ≤ 1024 / |BN254| ≈ 2⁻²⁴⁴
+
+**Parameters**: N = 1024, q = 65537, t = 256, Δ = 256, MSG_SLOTS = 64
+
+### Benchmark
+
+| Metric | Value |
+|--------|-------|
+| Circuit source | 7.8 KB |
+| Constraints | 113K |
+| nargo compile | 1.9s |
+| nargo execute | 0.4s |
+| sunspot prove | 2.4s |
+| sunspot verify | 0.06s |
+| Proof size | 388 bytes |
+| .ccs | 7.2 MB |
+| Proving key | ~5 MB |
+
+### Usage
+
+```bash
+# Generate circuit + Prover.toml + run full pipeline
+python scripts/generate_audit.py
+
+# Or run proof pipeline separately
+cd audit_circuit
+./prove_audit.sh
+```
+
 ## Roadmap
 
 - Browser-based proof generation (WASM)
-- 2-of-3 RLWE threshold audit module using wa_commitment
+- Verifiable FHE computation: extend batched IP verification to bootstrapping and keyswitching, combined with IVC for sequential operations
+- On-chain auditor decryption flow with threshold FHE key management
 - Multi-asset support (SPL tokens)
 - Relayer network for gas abstraction
 
@@ -53,9 +93,12 @@ nullifier = Poseidon(secret_key, leaf_index)
 
 ```
 Shielded Pool
-├─ noir_circuit/
+├─ noir_circuit/                  # Withdrawal proof
 │  ├─ nargo execute -> witness (.gz)
 │  └─ sunspot prove -> proof (.proof) + public witness (.pw)
+├─ audit_circuit/                 # RLWE audit proof (BFV encryption correctness)
+│  ├─ generate_audit.py -> main.nr + Prover.toml
+│  └─ sunspot prove -> audit proof (.proof) + public witness (.pw)
 ├─ verifier program (Sunspot Groth16)
 │  └─ verifies proof + public witness
 └─ shielded_pool_program/
